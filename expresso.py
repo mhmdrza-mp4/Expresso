@@ -1233,53 +1233,88 @@ def render_dashboard(state, console, t):
 # ---------- success screen ----------
 
 
-def sparkles(width, t):
-    bucket = int(t * 7)
+def hash01(x, y, k):
+    """Cheap deterministic pseudo-random number in [0, 1] for a grid cell."""
+    n = (x * 73856093) ^ (y * 19349663) ^ (k * 83492791)
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return (n & 0xFFFF) / 65535.0
+
+
+def starfield(width, rows, t, y0=0, density=0.04):
+    """A block of softly twinkling stars (static when t is constant)."""
+    if rows <= 0 or width <= 0:
+        return Text("")
     out = Text(no_wrap=True)
-    for x in range(width):
-        rnd = random.Random(bucket * 7919 + x)
-        if rnd.random() < 0.07:
-            ch = rnd.choice("✦✧·+*")
-            out.append(ch, fg(palette(OK_STOPS, rnd.random()), bold=True))
-        else:
-            out.append(" ")
+    for y in range(rows):
+        run = 0
+        for x in range(width):
+            if hash01(x, y + y0, 1) < density:
+                phase = hash01(x, y + y0, 2) * 6.283
+                level = 0.5 + 0.5 * math.sin(t * 3 + phase)
+                glyph = "·" if level < 0.33 else "✧" if level < 0.66 else "✦"
+                col = lerp(C_DIM, palette(OK_STOPS, hash01(x, y + y0, 3)), level)
+                if run:
+                    out.append(" " * run)
+                    run = 0
+                out.append(glyph, fg(col, bold=level > 0.66))
+            else:
+                run += 1
+        if run:
+            out.append(" " * run)
+        if y < rows - 1:
+            out.append("\n")
     return out
 
 
 def render_success(state, console, t, final=False):
-    w, _ = console.size
+    w, h = console.size
     r = state.result or {}
     art = ART_CONNECTED if w >= 86 else ART_ONLINE
     art_text = gradient_text(art, t, stops=OK_STOPS, shadow=True, speed=0.3)
 
+    items = [("SERVER", r.get("location", "-"))]
+    if r.get("passed") is not None:
+        changed = r.get("ip_changed")
+        items += [
+            ("PUBLIC IP", r.get("ip") or "unavailable"),
+            ("IP CHANGED", Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True)) if changed
+             else Text("could not compare", fg(C_MUTED))),
+            ("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-"),
+            ("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed"),
+        ]
+    items += [
+        ("CONNECT TIME", f"{r.get('seconds', 0):.2f} s"),
+        ("SERVERS TRIED", f"{state.tested}  ({state.failed} failed)"),
+        ("TOTAL RUNTIME", fmt_clock((state.done_at or time.monotonic()) - state.started)),
+    ]
     rows = Table.grid(padding=(0, 3))
     rows.add_column(justify="right", style=fg(C_MUTED), no_wrap=True)
     rows.add_column(style=fg(C_TEXT, bold=True), no_wrap=True)
-    rows.add_row("SERVER", r.get("location", "-"))
-    if r.get("passed") is not None:
-        rows.add_row("PUBLIC IP", r.get("ip") or "unavailable")
-        changed = r.get("ip_changed")
-        rows.add_row(
-            "IP CHANGED",
-            Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True)) if changed
-            else Text("could not compare", fg(C_MUTED)),
-        )
-        rows.add_row("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-")
-        rows.add_row("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed")
-    rows.add_row("CONNECT TIME", f"{r.get('seconds', 0):.2f} s")
-    rows.add_row("SERVERS TRIED", f"{state.tested}  ({state.failed} failed)")
-    rows.add_row("TOTAL RUNTIME", fmt_clock((state.done_at or time.monotonic()) - state.started))
+    for label, value in items:
+        rows.add_row(label, value)
 
     live_dot = Text(justify="center")
     live_dot.append("● ", fg(lerp(C_GREEN, WHITE, pulse(t, 5)) if not final else C_GREEN, bold=True))
     live_dot.append("SECURE TUNNEL ESTABLISHED", fg(C_GREEN, bold=True))
 
-    note = Text(justify="center")
-    note.append("The VPN stays connected after this window closes. "
-                "This server will be tried first next time.", fg(C_MUTED))
+    note_text = ("The VPN stays connected after this window closes. "
+                 "This server will be tried first next time.")
+    note = Text(note_text, style=fg(C_MUTED), justify="center")
 
-    pieces = [
-        Align.center(sparkles(max(10, min(w - 8, 80)), t)) if not final else Text(""),
+    # The card fills the whole terminal (a bit shorter when printed at the end,
+    # so the summary line and your shell prompt still fit below it).
+    total_h = max(10, h - 3) if final else h
+    inner_w = max(20, w - 6)
+    note_lines = -(-len(note_text) // inner_w)
+    content_h = len(art) + 1 + 1 + 1 + len(items) + 1 + note_lines
+    free = (total_h - 2) - content_h
+    top = max(0, free // 2)
+    bottom = max(0, free - top)
+
+    pieces = []
+    if top:
+        pieces.append(starfield(inner_w, top, t, y0=0))
+    pieces += [
         Align.center(art_text),
         Text(""),
         live_dot,
@@ -1288,6 +1323,9 @@ def render_success(state, console, t, final=False):
         Text(""),
         note,
     ]
+    if bottom:
+        pieces.append(starfield(inner_w, bottom, t, y0=top + 50))
+
     border = hx(C_GREEN if final else lerp(C_GREEN, C_CYAN, pulse(t, 2)))
     return Panel(
         Group(*pieces),
@@ -1295,6 +1333,7 @@ def render_success(state, console, t, final=False):
         border_style=border,
         box=box.DOUBLE,
         padding=(0, 2),
+        height=total_h,
     )
 
 
