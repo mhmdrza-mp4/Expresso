@@ -5,8 +5,8 @@ Expresso
 Tests ExpressVPN locations one by one, verifies that real internet traffic
 works through the tunnel, and stays connected to the first server that passes.
 
-  * Real health check: after the tunnel is up, several HTTPS endpoints are
-    probed in parallel, latency is measured and the public IP must change.
+  * Optional traffic check (VERIFY_TRAFFIC): after the tunnel is up, several
+    HTTPS endpoints are probed and the public IP must change.
   * Server history (SQLite): every attempt is remembered. Good servers are
     tried first, unknown ones get a fair chance, and servers that keep failing
     are put on hold for a while ("resting"), with a growing cool-down.
@@ -61,7 +61,11 @@ CONNECT_WAIT = 10  # max seconds to wait for the "connected" state
 ROUND_PAUSE = 30  # pause between full rounds when every server failed
 MANUAL_LOCATIONS: list[str] = []  # e.g. ["germany-frankfurt-1", "uk-london"]
 
-# --- health check -----------------------------------------------------------
+# --- health check (optional) ------------------------------------------------
+# Off by default: a server counts as "connected" as soon as the VPN reports it.
+# Turn it on to also require real internet traffic through the tunnel; servers
+# that connect but fail this check are then skipped.
+VERIFY_TRAFFIC = False
 HEALTH_URLS = [
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
@@ -258,12 +262,14 @@ class ServerStat:
     recent: list  # newest first, list[bool]
 
 
-STAGES = [
+STAGES_ALL = [
     ("RESET", "Clearing previous tunnel"),
     ("CONNECT", "Opening encrypted tunnel"),
     ("HANDSHAKE", "Waiting for the handshake"),
     ("VERIFY", "Testing real internet traffic"),
 ]
+STAGES = STAGES_ALL if VERIFY_TRAFFIC else STAGES_ALL[:3]
+N_STAGES = len(STAGES)
 
 
 class State:
@@ -279,9 +285,9 @@ class State:
 
         self.location: str | None = None
         self.active_stage = -1
-        self.stage_state = ["wait"] * 4
-        self.stage_time: list[float | None] = [None] * 4
-        self.stage_detail: list[str | None] = [None] * 4
+        self.stage_state = ["wait"] * N_STAGES
+        self.stage_time: list[float | None] = [None] * N_STAGES
+        self.stage_detail: list[str | None] = [None] * N_STAGES
         self.stage_started = 0.0
         self.flash: tuple[float, str] | None = None
         self.fail_reason: str | None = None
@@ -305,9 +311,9 @@ class State:
     def begin_attempt(self, location):
         self.location = location
         self.active_stage = -1
-        self.stage_state = ["wait"] * 4
-        self.stage_time = [None] * 4
-        self.stage_detail = [None] * 4
+        self.stage_state = ["wait"] * N_STAGES
+        self.stage_time = [None] * N_STAGES
+        self.stage_detail = [None] * N_STAGES
         self.fail_reason = None
         self.message = "Preparing probe"
 
@@ -621,6 +627,10 @@ class DemoBackend:
 
     handshake_wait = 2.2
 
+    # The demo is scripted: the first servers fail in these ways, then the next
+    # one connects. Handy for recording a GIF. Edit the list to change the story.
+    FAIL_PLAN = ["handshake", "cli", "handshake"]
+
     NAMES = [
         "USA - New York", "USA - Los Angeles", "USA - Miami", "USA - Chicago",
         "UK - London", "UK - Docklands", "Germany - Frankfurt", "Germany - Nuremberg",
@@ -635,18 +645,19 @@ class DemoBackend:
         self.quality = {n: rnd.random() ** 1.5 * 0.9 + 0.04 for n in self.NAMES}
         self.plan = "ok"
         self.connected_at = 0.0
+        self.attempts = 0
 
     def locations(self):
         time.sleep(0.6)
         return list(self.NAMES)
 
     def connect(self, location):
-        time.sleep(random.uniform(0.5, 1.4))
-        roll = random.random()
-        if roll < self.quality[location]:
-            self.plan = "ok"
+        time.sleep(random.uniform(0.8, 1.5))
+        self.attempts += 1
+        if self.attempts <= len(self.FAIL_PLAN):
+            self.plan = self.FAIL_PLAN[self.attempts - 1]
         else:
-            self.plan = random.choice(["cli", "handshake", "health", "health"])
+            self.plan = "ok"
         if self.plan == "cli":
             return False, "CLI error: server unavailable"
         self.connected_at = time.monotonic() + random.uniform(0.4, 1.0)
@@ -690,7 +701,7 @@ class Stopped(Exception):
 
 
 def attempt(state, backend, location, stop):
-    """Run the four stages for one server. Returns (ok, seconds, health, reason)."""
+    """Run the stages for one server. Returns (ok, seconds, health, reason)."""
     started = time.monotonic()
     health = None
     stage = 0
@@ -718,6 +729,8 @@ def attempt(state, backend, location, stop):
                 raise Fail("Handshake timeout")
             stop.wait(0.4)
         state.stage_end(2, True)
+        if not VERIFY_TRAFFIC:
+            return True, time.monotonic() - started, None, "Connected"
 
         stage = 3
         state.stage_begin(3)
@@ -757,8 +770,9 @@ def run_scanner(state, backend_factory, history, stop):
 
         state.message = "Clearing any old tunnel"
         backend.disconnect()
-        state.message = "Detecting your real IP address"
-        state.real_ip = backend.public_ip()
+        if VERIFY_TRAFFIC:
+            state.message = "Detecting your real IP address"
+            state.real_ip = backend.public_ip()
 
         state.phase = "scanning"
         while not stop.is_set():
@@ -805,9 +819,9 @@ def run_scanner(state, backend_factory, history, stop):
                         "ip": ip,
                         "seconds": seconds,
                         "latency": latency,
-                        "passed": health.passed,
-                        "total": health.total,
-                        "ip_changed": health.ip_changed,
+                        "passed": health.passed if health else None,
+                        "total": health.total if health else None,
+                        "ip_changed": health.ip_changed if health else None,
                     }
                     state.done_at = time.monotonic()
                     state.phase = "connected"
@@ -951,7 +965,7 @@ def render_tunnel(state, t, length):
     return out
 
 
-SHORT_NAMES = ["RESET", "CONNECT", "SHAKE", "VERIFY"]
+SHORT_NAMES = ["RESET", "CONNECT", "SHAKE", "VERIFY"][:N_STAGES]
 
 
 def stage_cell(state, i, t, short=False):
@@ -978,15 +992,15 @@ def stage_cell(state, i, t, short=False):
 
 def render_stages(state, t, short=False):
     grid = Table.grid(expand=True)
-    for i in range(7):
+    for i in range(2 * N_STAGES - 1):
         if i % 2 == 0:
             grid.add_column(justify="center", ratio=1, no_wrap=True)
         else:
             grid.add_column(justify="center", width=2 if short else 4, no_wrap=True)
     cells = []
-    for i in range(4):
+    for i in range(N_STAGES):
         cells.append(stage_cell(state, i, t, short))
-        if i < 3:
+        if i < N_STAGES - 1:
             done = state.stage_state[i] == "ok"
             link = "╼" if short else "─╼"
             cells.append(
@@ -1242,16 +1256,17 @@ def render_success(state, console, t, final=False):
     rows.add_column(justify="right", style=fg(C_MUTED), no_wrap=True)
     rows.add_column(style=fg(C_TEXT, bold=True), no_wrap=True)
     rows.add_row("SERVER", r.get("location", "-"))
-    rows.add_row("PUBLIC IP", r.get("ip") or "unavailable")
-    changed = r.get("ip_changed")
-    rows.add_row(
-        "IP CHANGED",
-        Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True)) if changed
-        else Text("could not compare", fg(C_MUTED)),
-    )
-    rows.add_row("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-")
-    rows.add_row("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed")
-    rows.add_row("PROBE TIME", f"{r.get('seconds', 0):.2f} s")
+    if r.get("passed") is not None:
+        rows.add_row("PUBLIC IP", r.get("ip") or "unavailable")
+        changed = r.get("ip_changed")
+        rows.add_row(
+            "IP CHANGED",
+            Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True)) if changed
+            else Text("could not compare", fg(C_MUTED)),
+        )
+        rows.add_row("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-")
+        rows.add_row("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed")
+    rows.add_row("CONNECT TIME", f"{r.get('seconds', 0):.2f} s")
     rows.add_row("SERVERS TRIED", f"{state.tested}  ({state.failed} failed)")
     rows.add_row("TOTAL RUNTIME", fmt_clock((state.done_at or time.monotonic()) - state.started))
 
@@ -1323,6 +1338,10 @@ def main():
         history.reset()
         console.print("[bold green]✔ Server history cleared.[/]")
         return
+    if args.demo:
+        # Same story on every demo run: fresh history, fixed server order.
+        history.reset()
+        random.seed(7)
 
     state = State()
     stop = threading.Event()
