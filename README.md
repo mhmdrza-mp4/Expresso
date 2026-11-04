@@ -45,10 +45,6 @@ Press `Ctrl+C` to stop. Once connected, the script exits and the VPN stays conne
 
 Edit the constants at the top of `expresso.py` (timeouts, health-check URLs, ranking and cool-down behavior, manual server list).
 
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) (in Persian).
-
 ## Disclaimer
 
 Expresso is an unofficial, independent tool. It is not affiliated with or endorsed by ExpressVPN. Use it at your own risk.
