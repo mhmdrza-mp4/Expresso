@@ -94,7 +94,6 @@ BENCH_MAX_MIN = 360  # cool-down ceiling (minutes)
 
 # --- UI ---------------------------------------------------------------------
 FPS = 20
-CELEBRATE_SECONDS = 3.5
 
 WIN_CANDIDATES = [
     r"C:\Program Files\ExpressVPN\expressvpnctl.exe",
@@ -1297,7 +1296,7 @@ def render_success(state, console, t, final=False):
     live_dot.append("● ", fg(lerp(C_GREEN, WHITE, pulse(t, 5)) if not final else C_GREEN, bold=True))
     live_dot.append("SECURE TUNNEL ESTABLISHED", fg(C_GREEN, bold=True))
 
-    note_text = ("The VPN stays connected after this window closes. "
+    note_text = ("The VPN stays connected. Press Ctrl+C to close this window. "
                  "This server will be tried first next time.")
     note = Text(note_text, style=fg(C_MUTED), justify="center")
 
@@ -1402,11 +1401,15 @@ def main():
             while worker.is_alive():
                 time.sleep(0.05)
             if state.phase == "connected":
-                time.sleep(CELEBRATE_SECONDS)
+                # Connected: keep the animated success screen open until Ctrl+C.
+                while True:
+                    time.sleep(0.25)
     except KeyboardInterrupt:
-        interrupted = True
-        stop.set()
-        worker.join(timeout=6)
+        # Ctrl+C after connecting only closes this window - the VPN stays connected.
+        if state.phase != "connected":
+            interrupted = True
+            stop.set()
+            worker.join(timeout=6)
 
     # ---- after the live screen is gone: leave a clean final printout ----
     if state.phase == "connected" and not interrupted:
