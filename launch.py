@@ -16,19 +16,14 @@ import sys
 import threading
 import time
 
-CLOSE_AFTER = 5  # seconds to keep the window open after the VPN is connected
-READY_TIMEOUT = 60  # seconds to wait for ExpressVPN to become ready
-FALLBACK_AFTER = 15  # seconds before trying the Start-menu launch if the direct launch did not help
-POLL = 0.25  # seconds between CLI polls
-
-CTL_CANDIDATES = [
-    r"C:\Program Files\ExpressVPN\expressvpnctl.exe",
-    r"C:\Program Files (x86)\ExpressVPN\expressvpnctl.exe",
-]
-APP_CANDIDATES = [
-    r"C:\Program Files\ExpressVPN\expressvpn-client.exe",
-    r"C:\Program Files (x86)\ExpressVPN\expressvpn-client.exe",
-]
+from config import (
+    APP_CANDIDATES,
+    CLOSE_AFTER,
+    CTL_CANDIDATES,
+    FALLBACK_AFTER,
+    POLL,
+    READY_TIMEOUT,
+)
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PASSTHROUGH_FLAGS = ("--demo", "--reset-history", "-h", "--help")
@@ -187,7 +182,12 @@ def main():
     if state and state.lower() == "connected":
         print("Disconnecting...")
         try:
-            subprocess.run([ctl, "disconnect"], capture_output=True, timeout=15, creationflags=NO_WINDOW)
+            subprocess.run(
+                [ctl, "disconnect"],
+                capture_output=True,
+                timeout=15,
+                creationflags=NO_WINDOW,
+            )
         except (subprocess.TimeoutExpired, OSError):
             pass
         sys.stdout.flush()
@@ -197,7 +197,9 @@ def main():
         state = start_and_wait(ctl)
 
     if state.lower() == "disconnected":
-        os.environ["EXPRESSO_ASSUME_CLEAN"] = "1"  # skip Expresso's own initial disconnect
+        os.environ["EXPRESSO_ASSUME_CLEAN"] = (
+            "1"  # skip Expresso's own initial disconnect
+        )
 
     threading.Thread(target=watch, args=(ctl,), daemon=True).start()
     run_expresso()
