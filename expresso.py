@@ -402,6 +402,27 @@ class History:
         with self._db() as c:
             c.execute("DELETE FROM attempts")
 
+    def last_success(self):
+        """Most recent server that connected and has not failed since."""
+        if not self.usable:
+            return None
+        try:
+            with self._db() as c:
+                row = c.execute(
+                    "SELECT location, ts FROM attempts WHERE ok = 1 AND ts > ? "
+                    "ORDER BY ts DESC LIMIT 1",
+                    (time.time() - HISTORY_DAYS * 86400,),
+                ).fetchone()
+                if not row:
+                    return None
+                failed_since = c.execute(
+                    "SELECT 1 FROM attempts WHERE location = ? AND ok = 0 AND ts > ? LIMIT 1",
+                    (row[0], row[1]),
+                ).fetchone()
+                return None if failed_since else row[0]
+        except sqlite3.Error:
+            return None
+
     def load(self) -> dict[str, ServerStat]:
         if not self.usable:
             return {}
@@ -762,10 +783,15 @@ def run_scanner(state, backend_factory, history, stop):
         state.message = "Locating ExpressVPN CLI"
         backend = backend_factory()
 
-        state.message = "Discovering server locations"
-        locations = backend.locations()
-        if not locations:
-            raise RuntimeError("No server locations found. Check MANUAL_LOCATIONS.")
+        # Fast path: try the last server that worked before listing all locations.
+        preferred = None if MANUAL_LOCATIONS else history.last_success()
+        locations = None
+        skip = None
+        if preferred is None:
+            state.message = "Discovering server locations"
+            locations = backend.locations()
+            if not locations:
+                raise RuntimeError("No server locations found. Check MANUAL_LOCATIONS.")
 
         state.message = "Clearing any old tunnel"
         backend.disconnect()
@@ -777,7 +803,12 @@ def run_scanner(state, backend_factory, history, stop):
         while not stop.is_set():
             state.round_no += 1
             stats = history.load()
-            ordered, benched = order_locations(locations, stats)
+            if locations is None:
+                ordered, benched = [preferred], 0
+            else:
+                ordered, benched = order_locations(locations, stats)
+                if skip:
+                    ordered = [loc for loc in ordered if loc != skip]
             state.total = len(ordered)
             state.completed = 0
             state.benched = benched
@@ -826,6 +857,16 @@ def run_scanner(state, backend_factory, history, stop):
                     state.phase = "connected"
                     return
                 stop.wait(0.45)  # let the failure flash be seen
+
+            if locations is None:
+                # Last known good server failed: discover everything and scan normally.
+                skip = preferred
+                state.message = "Discovering server locations"
+                locations = backend.locations()
+                if not locations:
+                    raise RuntimeError("No server locations found. Check MANUAL_LOCATIONS.")
+                state.round_no -= 1
+                continue
 
             # every server failed -> short break, then next round
             state.phase = "pause"
