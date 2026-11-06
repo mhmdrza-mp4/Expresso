@@ -1,0 +1,79 @@
+# ==========================================
+# Byte-compiled / optimized / C extensions
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# Virtual Environments (Highly Recommended)
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+/env/
+/venv/
+
+# ==========================================
+# Configuration and Environment Variables
+# ==========================================
+.env
+.env.*
+.secrets
+.local
+
+# ==========================================
+# Distribution / Packaging
+# ==========================================
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==========================================
+# Testing, Coverage, and Linting
+# ==========================================
+.htmlcov/
+.tox/
+.nosenv/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==========================================
+# Jupyter Notebooks and Data Science
+# ==========================================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# ==========================================
+# IDEs and Editors (Optional, can be global)
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
