@@ -1,6 +1,6 @@
 # Expresso ☕
 
-Expresso tests ExpressVPN servers for you, one by one, and stays connected to the first one that connects.
+Expresso tests ExpressVPN servers for you, one by one, and stays connected to the first one that works.
 
 ## Demo
 
@@ -8,11 +8,13 @@ Expresso tests ExpressVPN servers for you, one by one, and stays connected to th
 
 ## Features
 
-- **Auto scan:** tries servers until one connects, then keeps the connection.
-- **Simple goal:** connects as soon as ExpressVPN reports a working connection, then stops.
-- **Optional traffic check:** set `VERIFY_TRAFFIC = True` to also require real internet traffic through the tunnel.
-- **Learns over time:** every attempt is saved. Good servers are tried first, and servers that keep failing are put on hold for a while.
-- **Animated terminal UI** built with [rich](https://github.com/Textualize/rich).
+- **Auto Scan & Hold:** Tries servers sequentially and stays connected to the first working location.
+- **One-Click Launcher (`launch.py`):**
+  - **Instant Toggle:** If already connected, disconnects immediately and exits without loading heavy modules.
+  - **Auto-Start & Auto-Close:** If disconnected, opens ExpressVPN if needed, waits for its CLI, runs Expresso, and automatically closes the terminal window 5 seconds after connecting.
+- **Fast-Path & Smart Ranking:** Remembers every attempt in SQLite (`~/.expresso/history.db`). Tries the last working server first, prioritizes reliable locations, and benches failing servers with an exponential cool-down.
+- **Optional Traffic Verification:** Set `VERIFY_TRAFFIC = True` to probe multiple HTTPS endpoints and verify that your public IP changes before accepting a connection.
+- **Animated Terminal UI:** Built with [rich](https://github.com/Textualize/rich), featuring a live tunnel animation, stage timers, activity log, and server leaderboard.
 
 ## Requirements
 
@@ -26,24 +28,48 @@ pip install rich
 
 ## Usage
 
+### 1. One-Click Launcher (Recommended for shortcuts)
+
+```bash
+python launch.py
+```
+
+- **When connected:** Disconnects right away and exits.
+- **When disconnected:** Starts ExpressVPN if necessary, runs the scanner, and closes the window automatically once the tunnel is stable.
+
+### 2. Direct Scanner
+
 ```bash
 python expresso.py                  # scan and connect
 python expresso.py --demo           # preview the UI, no ExpressVPN needed
 python expresso.py --reset-history  # forget what it has learned
 ```
 
-Press `Ctrl+C` to stop. Once connected, the script exits and the VPN stays connected.
+Press `Ctrl+C` while scanning to stop and clean up any half-open tunnel. Once connected, pressing `Ctrl+C` closes the window while leaving the VPN connected.
 
 ## How it works
 
-1. Gets the list of server locations and ranks them using your past results.
-2. For each server: disconnect, connect, wait for the handshake (and optionally run the traffic check).
-3. Stops at the first server that connects.
-4. Saves every result to `~/.expresso/history.db` (SQLite).
+![How Expresso works](docs/diagram.svg)
+
+1. **Preflight Check:** Checks the current VPN state (disconnects and exits if already connected via `launch.py`).
+2. **History & Ranking:** Tries the last known good server first, or loads all locations and ranks them using past success rates, latency, and cool-down streaks.
+3. **Probe Pipeline:** For each candidate, runs **Reset** -> **Connect** -> **Handshake** (and optionally **Verify** for real HTTPS traffic and IP change).
+4. **Result & Loop:** Stops at the first server that passes. Failed attempts are logged to `~/.expresso/history.db`, and if all servers in the queue fail, Expresso pauses for 30 seconds before starting the next round.
 
 ## Settings
 
-Edit the constants at the top of `expresso.py` (timeouts, health-check URLs, ranking and cool-down behavior, manual server list).
+Fine-tune behavior by editing the constants at the top of `expresso.py` and `launch.py`:
+
+| File | Constant | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `expresso.py` | `VERIFY_TRAFFIC` | `False` | Require real HTTPS traffic and IP change through the tunnel |
+| `expresso.py` | `CONNECT_WAIT` | `8.5` | Max seconds to wait for the `connected` handshake |
+| `expresso.py` | `MANUAL_LOCATIONS` | `[]` | Custom list of locations to test instead of all regions |
+| `expresso.py` | `BENCH_AFTER` | `2` | Consecutive failures before a server is put on hold ("resting") |
+| `expresso.py` | `BENCH_BASE_MIN` | `10` | Initial cool-down in minutes (doubles on each extra failure) |
+| `expresso.py` | `ROUND_PAUSE` | `30` | Pause in seconds between full rounds when every server fails |
+| `launch.py` | `CLOSE_AFTER` | `5` | Seconds to keep the window open after connecting |
+| `launch.py` | `READY_TIMEOUT` | `60` | Max seconds to wait for the ExpressVPN service to start |
 
 ## Disclaimer
 
