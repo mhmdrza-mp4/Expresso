@@ -57,7 +57,8 @@ APP_NAME = "Expresso"
 
 # --- connection -------------------------------------------------------------
 CONNECT_TIMEOUT = 20  # max seconds for the CLI "connect" command
-CONNECT_WAIT = 10  # max seconds to wait for the "connected" state
+CONNECT_WAIT = 8.5  # max seconds to wait for the "connected" state
+EARLY_FAIL_SECS = 1.5  # "disconnected" this long right after connect -> give up on the server
 ROUND_PAUSE = 30  # pause between full rounds when every server failed
 MANUAL_LOCATIONS: list[str] = []  # e.g. ["germany-frankfurt-1", "uk-london"]
 
@@ -305,6 +306,7 @@ class State:
         self.board: list[ServerStat] = []
         self.real_ip: str | None = None
         self.result: dict | None = None
+        self.tunnel_clean = False  # True once a disconnect has completed and nothing connected since
 
     # -- attempt bookkeeping ---------------------------------------------
     def begin_attempt(self, location):
@@ -586,8 +588,19 @@ class ExpressBackend:
     def disconnect(self):
         try:
             run_cli(self.cli, ["disconnect"], timeout=15)
+            return True
         except (subprocess.TimeoutExpired, OSError):
-            pass
+            return False
+
+    def poll(self):
+        """One CLI call -> 'connected', 'disconnected', another state, or None."""
+        if self.flavor == "ctl":
+            try:
+                out, code = run_cli(self.cli, ["get", "connectionstate"], timeout=8)
+            except (subprocess.TimeoutExpired, OSError):
+                return None
+            return out.strip().lower() if code == 0 else None
+        return "connected" if self.is_connected() else None
 
     def is_connected(self):
         try:
@@ -691,6 +704,9 @@ class DemoBackend:
             return False
         return time.monotonic() >= self.connected_at
 
+    def poll(self):
+        return "connected" if self.is_connected() else "connecting"
+
     def public_ip(self, timeout=2.5):
         time.sleep(0.4)
         return ".".join(str(random.randint(11, 220)) for _ in range(4))
@@ -727,13 +743,15 @@ def attempt(state, backend, location, stop):
     stage = 0
     try:
         state.stage_begin(0)
-        backend.disconnect()
+        if not state.tunnel_clean:
+            state.tunnel_clean = backend.disconnect() is not False
         state.stage_end(0, True)
         if stop.is_set():
             raise Stopped
 
         stage = 1
         state.stage_begin(1)
+        state.tunnel_clean = False
         ok, message = backend.connect(location)
         if not ok:
             raise Fail(message)
@@ -742,12 +760,23 @@ def attempt(state, backend, location, stop):
         stage = 2
         state.stage_begin(2)
         deadline = time.monotonic() + backend.handshake_wait
-        while not backend.is_connected():
+        dead_since = None
+        while True:
+            conn_state = backend.poll()
+            if conn_state == "connected":
+                break
             if stop.is_set():
                 raise Stopped
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 raise Fail("Handshake timeout")
-            stop.wait(0.4)
+            if conn_state == "disconnected":
+                dead_since = dead_since or now
+                if now - dead_since >= EARLY_FAIL_SECS:
+                    raise Fail("Server refused")
+            else:
+                dead_since = None
+            stop.wait(0.15)
         state.stage_end(2, True)
         if not VERIFY_TRAFFIC:
             return True, time.monotonic() - started, None, "Connected"
@@ -774,7 +803,7 @@ def attempt(state, backend, location, stop):
     state.stage_end(stage, False)
     state.fail_reason = reason
     state.message = reason
-    backend.disconnect()
+    state.tunnel_clean = backend.disconnect() is not False
     return False, time.monotonic() - started, health, reason
 
 
@@ -794,7 +823,7 @@ def run_scanner(state, backend_factory, history, stop):
                 raise RuntimeError("No server locations found. Check MANUAL_LOCATIONS.")
 
         state.message = "Clearing any old tunnel"
-        backend.disconnect()
+        state.tunnel_clean = backend.disconnect() is not False
         if VERIFY_TRAFFIC:
             state.message = "Detecting your real IP address"
             state.real_ip = backend.public_ip()
@@ -856,7 +885,6 @@ def run_scanner(state, backend_factory, history, stop):
                     state.done_at = time.monotonic()
                     state.phase = "connected"
                     return
-                stop.wait(0.45)  # let the failure flash be seen
 
             if locations is None:
                 # Last known good server failed: discover everything and scan normally.

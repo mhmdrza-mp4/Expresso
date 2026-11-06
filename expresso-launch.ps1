@@ -4,13 +4,18 @@
 #                        then close the script window $CloseAfter seconds after the VPN is connected
 $ErrorActionPreference = 'Stop'
 
-$Script     = Join-Path $PSScriptRoot 'expresso.py'
-$Timeout    = 60   # seconds to wait for ExpressVPN to become ready
-$CloseAfter = 5    # seconds to keep the script open after the VPN is connected
+$Script        = Join-Path $PSScriptRoot 'expresso.py'
+$Timeout       = 60   # seconds to wait for ExpressVPN to become ready
+$FallbackAfter = 15   # seconds before trying the Start-menu launch if the direct launch did not help
+$CloseAfter    = 5    # seconds to keep the script open after the VPN is connected
 
 $CtlCandidates = @(
     'C:\Program Files\ExpressVPN\expressvpnctl.exe',
     'C:\Program Files (x86)\ExpressVPN\expressvpnctl.exe'
+)
+$AppCandidates = @(
+    'C:\Program Files\ExpressVPN\expressvpn-client.exe',
+    'C:\Program Files (x86)\ExpressVPN\expressvpn-client.exe'
 )
 $Ctl = $CtlCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $Ctl) {
@@ -28,28 +33,46 @@ function Get-VpnState {
     return $null
 }
 
+# Slow path: find the app through the Start menu.
+function Start-AppViaStartMenu {
+    $app = Get-StartApps | Where-Object { $_.Name -like '*ExpressVPN*' } | Select-Object -First 1
+    if (-not $app) { Write-Host 'ExpressVPN app not found.' -ForegroundColor Red; Read-Host 'Enter to exit'; exit 1 }
+    Start-Process "shell:AppsFolder\$($app.AppID)"
+}
+
 $state = Get-VpnState
 
 if ($state -eq 'Connected') {
     Write-Host 'Disconnecting...'
     try { & $Ctl disconnect 2>&1 | Out-Null } catch { }
-    Start-Sleep -Seconds 2
     exit 0
 }
 
 if (-not $state) {
-    $app = Get-StartApps | Where-Object { $_.Name -like '*ExpressVPN*' } | Select-Object -First 1
-    if (-not $app) { Write-Host 'ExpressVPN app not found in Start menu.' -ForegroundColor Red; Read-Host 'Enter to exit'; exit 1 }
     Write-Host 'Starting ExpressVPN...'
-    Start-Process "shell:AppsFolder\$($app.AppID)"
+    $appExe = $AppCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $usedFallback = $false
+    if ($appExe) {
+        Start-Process $appExe
+    } else {
+        Start-AppViaStartMenu
+        $usedFallback = $true
+    }
 
-    $deadline = (Get-Date).AddSeconds($Timeout)
+    $started  = Get-Date
+    $deadline = $started.AddSeconds($Timeout)
+    $fallbackAt = $started.AddSeconds($FallbackAfter)
     while (-not (Get-VpnState)) {
-        if ((Get-Date) -gt $deadline) {
+        $now = Get-Date
+        if ($now -gt $deadline) {
             Write-Host "ExpressVPN not ready after $Timeout s." -ForegroundColor Red
             Read-Host 'Enter to exit'; exit 1
         }
-        Start-Sleep -Seconds 1
+        if (-not $usedFallback -and $now -gt $fallbackAt) {
+            Start-AppViaStartMenu
+            $usedFallback = $true
+        }
+        Start-Sleep -Milliseconds 250
     }
 }
 
@@ -60,7 +83,7 @@ $null = $proc.Handle   # keep the handle so ExitCode stays readable
 
 $since = $null
 while (-not $proc.HasExited) {
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 250
     if ((Get-VpnState) -eq 'Connected') {
         if (-not $since) { $since = Get-Date }
         if (((Get-Date) - $since).TotalSeconds -ge $CloseAfter) {
