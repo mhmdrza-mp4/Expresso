@@ -58,18 +58,18 @@ Press `Ctrl+C` while scanning to stop and clean up any half-open tunnel. Once co
 
 ## Settings
 
-Fine-tune behavior by editing the constants at the top of `expresso.py` and `launch.py`:
+Fine-tune behavior by editing the constants in `config.py`:
 
-| File | Constant | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `expresso.py` | `VERIFY_TRAFFIC` | `False` | Require real HTTPS traffic and IP change through the tunnel |
-| `expresso.py` | `CONNECT_WAIT` | `8.5` | Max seconds to wait for the `connected` handshake |
-| `expresso.py` | `MANUAL_LOCATIONS` | `[]` | Custom list of locations to test instead of all regions |
-| `expresso.py` | `BENCH_AFTER` | `2` | Consecutive failures before a server is put on hold ("resting") |
-| `expresso.py` | `BENCH_BASE_MIN` | `10` | Initial cool-down in minutes (doubles on each extra failure) |
-| `expresso.py` | `ROUND_PAUSE` | `30` | Pause in seconds between full rounds when every server fails |
-| `launch.py` | `CLOSE_AFTER` | `5` | Seconds to keep the window open after connecting |
-| `launch.py` | `READY_TIMEOUT` | `60` | Max seconds to wait for the ExpressVPN service to start |
+| Constant | Default | Description |
+| :--- | :--- | :--- |
+| `VERIFY_TRAFFIC` | `False` | Require real HTTPS traffic and IP change through the tunnel |
+| `CONNECT_WAIT` | `8.5` | Max seconds to wait for the `connected` handshake |
+| `MANUAL_LOCATIONS` | `[]` | Custom list of locations to test instead of all regions |
+| `BENCH_AFTER` | `2` | Consecutive failures before a server is put on hold ("resting") |
+| `BENCH_BASE_MIN` | `10` | Initial cool-down in minutes (doubles on each extra failure) |
+| `ROUND_PAUSE` | `30` | Pause in seconds between full rounds when every server fails |
+| `CLOSE_AFTER` | `5` | Seconds to keep the window open after connecting |
+| `READY_TIMEOUT` | `60` | Max seconds to wait for the ExpressVPN service to start |
 
 ## Disclaimer
 
