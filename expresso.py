@@ -46,62 +46,33 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
-# ============================================================
-#                    CONFIGURATION
-# ============================================================
-
-APP_NAME = "Expresso"
-
-# --- connection -------------------------------------------------------------
-CONNECT_TIMEOUT = 20  # max seconds for the CLI "connect" command
-CONNECT_WAIT = 8.5  # max seconds to wait for the "connected" state
-EARLY_FAIL_SECS = 1.5  # "disconnected" this long right after connect -> give up on the server
-ROUND_PAUSE = 30  # pause between full rounds when every server failed
-MANUAL_LOCATIONS: list[str] = []  # e.g. ["germany-frankfurt-1", "uk-london"]
-
-# --- health check (optional) ------------------------------------------------
-# Off by default: a server counts as "connected" as soon as the VPN reports it.
-# Turn it on to also require real internet traffic through the tunnel; servers
-# that connect but fail this check are then skipped.
-VERIFY_TRAFFIC = False
-HEALTH_URLS = [
-    "https://www.gstatic.com/generate_204",
-    "https://cp.cloudflare.com/generate_204",
-    "https://www.msftconnecttest.com/connecttest.txt",
-]
-HEALTH_MIN_PASS = 2  # how many of the URLs must answer
-HEALTH_TIMEOUT = 2.5  # seconds per probe
-HEALTH_WAIT = 5.0  # total seconds we keep retrying the check
-IP_SERVICES = [
-    "https://api.ipify.org",
-    "https://ifconfig.me/ip",
-    "https://icanhazip.com",
-]
-
-# --- history / ranking ------------------------------------------------------
-HISTORY_FILE = Path.home() / ".expresso" / "history.db"
-HISTORY_DAYS = 30  # attempts older than this are ignored
-HISTORY_KEEP = 20  # last N attempts per server are considered
-DECAY = 0.85  # newer attempts weigh more
-PRIOR_RATE = 0.60  # optimistic guess for servers we know nothing about
-PRIOR_WEIGHT = 2.0  # how strongly that guess counts
-JITTER = 0.06  # small randomness so the order isn't fully fixed
-BENCH_AFTER = 2  # consecutive failures before a server is benched
-BENCH_BASE_MIN = 10  # first cool-down (minutes), doubles each extra failure
-BENCH_MAX_MIN = 360  # cool-down ceiling (minutes)
-
-# --- UI ---------------------------------------------------------------------
-FPS = 20
-
-WIN_CANDIDATES = [
-    r"C:\Program Files\ExpressVPN\expressvpnctl.exe",
-    r"C:\Program Files (x86)\ExpressVPN\expressvpnctl.exe",
-    r"C:\Program Files\ExpressVPN\services\ExpressVPN.CLI.exe",
-    r"C:\Program Files (x86)\ExpressVPN\services\ExpressVPN.CLI.exe",
-]
-
-USER_AGENT = "Expresso"
-
+from config import (
+    APP_NAME,
+    BENCH_AFTER,
+    BENCH_BASE_MIN,
+    BENCH_MAX_MIN,
+    CONNECT_TIMEOUT,
+    CONNECT_WAIT,
+    DECAY,
+    EARLY_FAIL_SECS,
+    FPS,
+    HEALTH_MIN_PASS,
+    HEALTH_TIMEOUT,
+    HEALTH_URLS,
+    HEALTH_WAIT,
+    HISTORY_DAYS,
+    HISTORY_FILE,
+    HISTORY_KEEP,
+    IP_SERVICES,
+    JITTER,
+    MANUAL_LOCATIONS,
+    PRIOR_RATE,
+    PRIOR_WEIGHT,
+    ROUND_PAUSE,
+    USER_AGENT,
+    VERIFY_TRAFFIC,
+    WIN_CANDIDATES,
+)
 
 # ============================================================
 #                    COLOR / DRAWING HELPERS
@@ -121,7 +92,14 @@ C_DIM = (55, 65, 81)
 C_TRACK = (31, 41, 55)
 WHITE = (255, 255, 255)
 
-LOGO_STOPS = [(245, 222, 179), (251, 191, 36), (217, 119, 6), (146, 84, 40), (217, 119, 6), (251, 191, 36)]
+LOGO_STOPS = [
+    (245, 222, 179),
+    (251, 191, 36),
+    (217, 119, 6),
+    (146, 84, 40),
+    (217, 119, 6),
+    (251, 191, 36),
+]
 OK_STOPS = [C_GREEN, C_TEAL, C_CYAN, C_TEAL]
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -303,7 +281,9 @@ class State:
         self.board: list[ServerStat] = []
         self.real_ip: str | None = None
         self.result: dict | None = None
-        self.tunnel_clean = False  # True once a disconnect has completed and nothing connected since
+        self.tunnel_clean = (
+            False  # True once a disconnect has completed and nothing connected since
+        )
 
     # -- attempt bookkeeping ---------------------------------------------
     def begin_attempt(self, location):
@@ -390,7 +370,15 @@ class History:
                     "INSERT INTO attempts "
                     "(ts, location, ok, connect_time, latency_ms, ip, reason) "
                     "VALUES (?,?,?,?,?,?,?)",
-                    (time.time(), location, int(ok), connect_time, latency_ms, ip, reason),
+                    (
+                        time.time(),
+                        location,
+                        int(ok),
+                        connect_time,
+                        latency_ms,
+                        ip,
+                        reason,
+                    ),
                 )
         except sqlite3.Error:
             pass
@@ -581,7 +569,9 @@ class ExpressBackend:
         output, code = run_cli(self.cli, ["connect", location], timeout=CONNECT_TIMEOUT)
         if code != 0:
             first = (output.splitlines() or [""])[0].strip()
-            return False, ("CLI error: " + first[:44]) if first else "CLI connection error"
+            return False, (
+                ("CLI error: " + first[:44]) if first else "CLI connection error"
+            )
         return True, ""
 
     def disconnect(self):
@@ -639,13 +629,18 @@ class ExpressBackend:
         good: list[float] = []
         with ThreadPoolExecutor(total) as pool:
             while True:
-                results = list(pool.map(lambda u: probe(u, HEALTH_TIMEOUT), HEALTH_URLS))
+                results = list(
+                    pool.map(lambda u: probe(u, HEALTH_TIMEOUT), HEALTH_URLS)
+                )
                 good = [r for r in results if r is not None]
                 if len(good) >= HEALTH_MIN_PASS:
                     break
                 if stop.is_set() or time.monotonic() >= deadline:
                     return HealthResult(
-                        False, None, len(good), total,
+                        False,
+                        None,
+                        len(good),
+                        total,
                         reason=f"No real traffic ({len(good)}/{total} probes)",
                     )
                 stop.wait(0.6)
@@ -654,10 +649,17 @@ class ExpressBackend:
         changed = None if (ip is None or real_ip is None) else ip != real_ip
         if changed is False:
             return HealthResult(
-                False, None, len(good), total, ip, False,
+                False,
+                None,
+                len(good),
+                total,
+                ip,
+                False,
                 reason="IP unchanged - tunnel not routing",
             )
-        return HealthResult(True, statistics.median(good), len(good), total, ip, changed)
+        return HealthResult(
+            True, statistics.median(good), len(good), total, ip, changed
+        )
 
 
 class DemoBackend:
@@ -670,12 +672,30 @@ class DemoBackend:
     FAIL_PLAN = ["handshake", "cli", "handshake"]
 
     NAMES = [
-        "USA - New York", "USA - Los Angeles", "USA - Miami", "USA - Chicago",
-        "UK - London", "UK - Docklands", "Germany - Frankfurt", "Germany - Nuremberg",
-        "Netherlands - Amsterdam", "France - Paris", "Switzerland", "Sweden",
-        "Spain - Madrid", "Italy - Milan", "Canada - Toronto", "Japan - Tokyo",
-        "Singapore - CBD", "Hong Kong", "Turkey", "UAE - Dubai", "Australia - Sydney",
-        "Poland", "Romania", "Brazil - Sao Paulo",
+        "USA - New York",
+        "USA - Los Angeles",
+        "USA - Miami",
+        "USA - Chicago",
+        "UK - London",
+        "UK - Docklands",
+        "Germany - Frankfurt",
+        "Germany - Nuremberg",
+        "Netherlands - Amsterdam",
+        "France - Paris",
+        "Switzerland",
+        "Sweden",
+        "Spain - Madrid",
+        "Italy - Milan",
+        "Canada - Toronto",
+        "Japan - Tokyo",
+        "Singapore - CBD",
+        "Hong Kong",
+        "Turkey",
+        "UAE - Dubai",
+        "Australia - Sydney",
+        "Poland",
+        "Romania",
+        "Brazil - Sao Paulo",
     ]
 
     def __init__(self):
@@ -720,12 +740,13 @@ class DemoBackend:
         time.sleep(random.uniform(0.9, 1.7))
         if self.plan == "health":
             return HealthResult(
-                False, None, random.choice([0, 1]), 3,
+                False,
+                None,
+                random.choice([0, 1]),
+                3,
                 reason="No real traffic (0/3 probes)",
             )
-        return HealthResult(
-            True, random.uniform(55, 320), 3, 3, self.public_ip(), True
-        )
+        return HealthResult(True, random.uniform(55, 320), 3, 3, self.public_ip(), True)
 
 
 # ============================================================
@@ -793,7 +814,9 @@ def attempt(state, backend, location, stop):
             raise Stopped
         if not health.ok:
             raise Fail(health.reason)
-        state.stage_end(3, True, f"{health.passed}/{health.total} · {health.latency:.0f}ms")
+        state.stage_end(
+            3, True, f"{health.passed}/{health.total} · {health.latency:.0f}ms"
+        )
         return True, time.monotonic() - started, health, "Connected"
 
     except Stopped:
@@ -900,7 +923,9 @@ def run_scanner(state, backend_factory, history, stop):
                 state.message = "Discovering server locations"
                 locations = backend.locations()
                 if not locations:
-                    raise RuntimeError("No server locations found. Check MANUAL_LOCATIONS.")
+                    raise RuntimeError(
+                        "No server locations found. Check MANUAL_LOCATIONS."
+                    )
                 state.round_no -= 1
                 continue
 
@@ -966,7 +991,9 @@ def render_header(state, t, compact, border):
     tag = taglines.get(state.phase, "")
     if compact:
         title = gradient_text(["E X P R E S S O"], t)
-        return Panel(Align.center(title), box=box.ROUNDED, border_style=border, padding=(0, 1))
+        return Panel(
+            Align.center(title), box=box.ROUNDED, border_style=border, padding=(0, 1)
+        )
 
     sub = Text(no_wrap=True)
     sub.append("S E R V E R   S C A N N E R", fg(C_TEXT, bold=True))
@@ -1017,7 +1044,9 @@ def render_tunnel(state, t, length):
         speed = 14 if stage == 2 else 11
         count = max(2, length // 14)
         for k in range(count):
-            raw = (t * speed + k * length / count) % (length * (2 if mode == "bounce" else 1))
+            raw = (t * speed + k * length / count) % (
+                length * (2 if mode == "bounce" else 1)
+            )
             pos = int(raw)
             if mode == "bounce" and pos >= length:
                 pos = 2 * length - 1 - pos
@@ -1030,7 +1059,9 @@ def render_tunnel(state, t, length):
                     chars[p] = ch
                     styles[p] = fg(lerp(base, packet, k2), bold=(d == 0))
 
-    right_col = {"ok": C_GREEN, "fail": C_RED}.get(mode, C_CYAN if stage >= 1 else C_MUTED)
+    right_col = {"ok": C_GREEN, "fail": C_RED}.get(
+        mode, C_CYAN if stage >= 1 else C_MUTED
+    )
     out = Text(no_wrap=True)
     out.append("YOU ", fg(C_MUTED))
     out.append("●", fg(C_CYAN, bold=True))
@@ -1080,8 +1111,11 @@ def render_stages(state, t, short=False):
             done = state.stage_state[i] == "ok"
             link = "╼" if short else "─╼"
             cells.append(
-                Text(link if done else ("╌" if short else "╌╌"),
-                     style=fg(C_GREEN if done else C_DIM), justify="center")
+                Text(
+                    link if done else ("╌" if short else "╌╌"),
+                    style=fg(C_GREEN if done else C_DIM),
+                    justify="center",
+                )
             )
     grid.add_row(*cells)
     return grid
@@ -1094,15 +1128,25 @@ def render_target(state, t, w, compact, border):
     head = Text(no_wrap=True)
     if state.location:
         head.append("◆ PROBING  ", fg(C_CYAN, bold=True))
-        head.append(f"candidate {min(state.completed + 1, state.total)}/{state.total}", fg(C_MUTED))
+        head.append(
+            f"candidate {min(state.completed + 1, state.total)}/{state.total}",
+            fg(C_MUTED),
+        )
     else:
         head.append("◆ STANDBY", fg(C_MUTED, bold=True))
 
     name = Text(no_wrap=True, overflow="ellipsis")
-    name.append(state.location or "waiting for the next round…", fg(C_TEXT if state.location else C_MUTED, bold=True))
+    name.append(
+        state.location or "waiting for the next round…",
+        fg(C_TEXT if state.location else C_MUTED, bold=True),
+    )
 
     dots = "." * (int(t * 2.5) % 4)
-    if state.stage_state[state.active_stage if state.active_stage >= 0 else 0] == "fail" and state.fail_reason:
+    if (
+        state.stage_state[state.active_stage if state.active_stage >= 0 else 0]
+        == "fail"
+        and state.fail_reason
+    ):
         status = Text(no_wrap=True, overflow="ellipsis")
         status.append("✘ ", fg(C_RED, bold=True))
         status.append(state.fail_reason, fg(C_RED))
@@ -1142,8 +1186,10 @@ def wave(t, width, energy):
     for x in range(width):
         amp = (0.55 + 0.45 * math.sin(x * 0.07 + t * 1.3)) * energy
         v = 0.5 + 0.5 * math.sin(x * 0.28 - t * 5) * amp
-        out.append(blocks[min(7, int(max(0.0, min(1.0, v)) * 8))],
-                   fg(palette(LOGO_STOPS, x / max(1, width) - t * 0.1)))
+        out.append(
+            blocks[min(7, int(max(0.0, min(1.0, v)) * 8))],
+            fg(palette(LOGO_STOPS, x / max(1, width) - t * 0.1)),
+        )
     return out
 
 
@@ -1167,7 +1213,9 @@ def render_stats(state, t, border, w=120, compact=False):
     if not compact:
         energy = 0.2 if state.phase in ("pause", "init") else 1.0
         content = Group(grid, Text(""), wave(t, max(10, int(w * 0.4) - 6), energy))
-    return panel(content, "STATISTICS", border, subtitle="learned from history", padding=(0, 1))
+    return panel(
+        content, "STATISTICS", border, subtitle="learned from history", padding=(0, 1)
+    )
 
 
 # ---------- progress ----------
@@ -1195,8 +1243,12 @@ def render_progress(state, t, w):
 
 def render_log(state, rows, border):
     table = Table(
-        box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False,
-        header_style=fg(C_CYAN, bold=True), padding=(0, 1),
+        box=box.SIMPLE_HEAD,
+        expand=True,
+        show_edge=False,
+        pad_edge=False,
+        header_style=fg(C_CYAN, bold=True),
+        padding=(0, 1),
     )
     table.add_column("#", width=4, justify="right", no_wrap=True)
     table.add_column("SERVER", ratio=3, no_wrap=True, overflow="ellipsis")
@@ -1208,7 +1260,14 @@ def render_log(state, rows, border):
     entries = list(reversed(state.log_snapshot()))[:rows]
     now = time.monotonic()
     if not entries:
-        table.add_row("-", Text("waiting for the first result…", style=fg(C_MUTED)), "", "", "", "")
+        table.add_row(
+            "-",
+            Text("waiting for the first result…", style=fg(C_MUTED)),
+            "",
+            "",
+            "",
+            "",
+        )
     for idx, e in enumerate(entries):
         fresh = now - e["ts"] < 1.2
         dim = idx >= 4
@@ -1233,8 +1292,12 @@ def render_log(state, rows, border):
 
 def render_board(state, rows, border):
     table = Table(
-        box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False,
-        header_style=fg(C_VIOLET, bold=True), padding=(0, 1),
+        box=box.SIMPLE_HEAD,
+        expand=True,
+        show_edge=False,
+        pad_edge=False,
+        header_style=fg(C_VIOLET, bold=True),
+        padding=(0, 1),
     )
     table.add_column("#", width=2, justify="right", no_wrap=True)
     table.add_column("SERVER", ratio=3, no_wrap=True, overflow="ellipsis")
@@ -1244,9 +1307,19 @@ def render_board(state, rows, border):
 
     board = state.board[:rows]
     if not board:
-        table.add_row("", Text("no history yet - it learns as it runs", style=fg(C_MUTED)), "", "", "")
+        table.add_row(
+            "",
+            Text("no history yet - it learns as it runs", style=fg(C_MUTED)),
+            "",
+            "",
+            "",
+        )
     for i, st in enumerate(board, 1):
-        col = C_MUTED if st.benched else (C_GREEN if st.rate >= 0.7 else C_AMBER if st.rate >= 0.4 else C_RED)
+        col = (
+            C_MUTED
+            if st.benched
+            else (C_GREEN if st.rate >= 0.7 else C_AMBER if st.rate >= 0.4 else C_RED)
+        )
         trend = Text(no_wrap=True)
         for ok in reversed(st.recent[:6]):
             trend.append("▮", fg(C_GREEN if ok else C_RED, dim=st.benched))
@@ -1260,7 +1333,13 @@ def render_board(state, rows, border):
             Text(f"{st.avg_latency:.0f}ms" if st.avg_latency else "-", fg(C_MUTED)),
             trend,
         )
-    return panel(table, "SERVER RANKING", border, subtitle="zz = resting after failures", padding=(0, 1))
+    return panel(
+        table,
+        "SERVER RANKING",
+        border,
+        subtitle="zz = resting after failures",
+        padding=(0, 1),
+    )
 
 
 def render_footer(state, w=120):
@@ -1353,15 +1432,24 @@ def render_success(state, console, t, final=False):
         changed = r.get("ip_changed")
         items += [
             ("PUBLIC IP", r.get("ip") or "unavailable"),
-            ("IP CHANGED", Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True)) if changed
-             else Text("could not compare", fg(C_MUTED))),
+            (
+                "IP CHANGED",
+                (
+                    Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True))
+                    if changed
+                    else Text("could not compare", fg(C_MUTED))
+                ),
+            ),
             ("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-"),
             ("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed"),
         ]
     items += [
         ("CONNECT TIME", f"{r.get('seconds', 0):.2f} s"),
         ("SERVERS TRIED", f"{state.tested}  ({state.failed} failed)"),
-        ("TOTAL RUNTIME", fmt_clock((state.done_at or time.monotonic()) - state.started)),
+        (
+            "TOTAL RUNTIME",
+            fmt_clock((state.done_at or time.monotonic()) - state.started),
+        ),
     ]
     rows = Table.grid(padding=(0, 3))
     rows.add_column(justify="right", style=fg(C_MUTED), no_wrap=True)
@@ -1370,11 +1458,15 @@ def render_success(state, console, t, final=False):
         rows.add_row(label, value)
 
     live_dot = Text(justify="center")
-    live_dot.append("● ", fg(lerp(C_GREEN, WHITE, pulse(t, 5)) if not final else C_GREEN, bold=True))
+    live_dot.append(
+        "● ", fg(lerp(C_GREEN, WHITE, pulse(t, 5)) if not final else C_GREEN, bold=True)
+    )
     live_dot.append("SECURE TUNNEL ESTABLISHED", fg(C_GREEN, bold=True))
 
-    note_text = ("The VPN stays connected. Press Ctrl+C to close this window. "
-                 "This server will be tried first next time.")
+    note_text = (
+        "The VPN stays connected. Press Ctrl+C to close this window. "
+        "This server will be tried first next time."
+    )
     note = Text(note_text, style=fg(C_MUTED), justify="center")
 
     # The card fills the whole terminal (a bit shorter when printed at the end,
@@ -1426,9 +1518,15 @@ def render(state, console):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Expresso - find and hold a working ExpressVPN server")
-    ap.add_argument("--demo", action="store_true", help="preview the UI with a fake VPN")
-    ap.add_argument("--reset-history", action="store_true", help="forget learned server history")
+    ap = argparse.ArgumentParser(
+        description="Expresso - find and hold a working ExpressVPN server"
+    )
+    ap.add_argument(
+        "--demo", action="store_true", help="preview the UI with a fake VPN"
+    )
+    ap.add_argument(
+        "--reset-history", action="store_true", help="forget learned server history"
+    )
     return ap.parse_args()
 
 
@@ -1447,7 +1545,9 @@ def main():
     except Exception:  # noqa: BLE001
         pass
 
-    history_path = HISTORY_FILE.with_name("history_demo.db") if args.demo else HISTORY_FILE
+    history_path = (
+        HISTORY_FILE.with_name("history_demo.db") if args.demo else HISTORY_FILE
+    )
     history = History(history_path)
     if args.reset_history:
         history.reset()
@@ -1493,12 +1593,21 @@ def main():
         console.print(render_success(state, console, 0.0, final=True))
     elif state.phase == "error":
         console.print(
-            panel(Text(state.error or "Unknown error", style=fg(C_RED)), "APPLICATION ERROR", hx(C_RED), padding=(1, 2))
+            panel(
+                Text(state.error or "Unknown error", style=fg(C_RED)),
+                "APPLICATION ERROR",
+                hx(C_RED),
+                padding=(1, 2),
+            )
         )
     else:
         console.print(
             Panel(
-                Text("Scanner stopped by user.", style=fg(C_AMBER, bold=True), justify="center"),
+                Text(
+                    "Scanner stopped by user.",
+                    style=fg(C_AMBER, bold=True),
+                    justify="center",
+                ),
                 box=box.ROUNDED,
                 border_style=hx(C_AMBER),
             )
