@@ -21,19 +21,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import math
+import os
 import random
 import shutil
 import sqlite3
-import statistics
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -533,6 +530,8 @@ def run_cli(cli, args, timeout=30):
 
 def probe(url, timeout):
     """Return the response time in ms, or None when the probe failed."""
+    import urllib.request  # lazy: only needed for the optional traffic check
+
     started = time.monotonic()
     try:
         req = urllib.request.Request(
@@ -616,6 +615,9 @@ class ExpressBackend:
             return False
 
     def public_ip(self, timeout=2.5):
+        import ipaddress  # lazy: only needed for the optional traffic check
+        import urllib.request
+
         for url in IP_SERVICES:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -629,6 +631,9 @@ class ExpressBackend:
 
     def health(self, real_ip, stop):
         """Probe several endpoints in parallel until enough of them answer."""
+        import statistics  # lazy: only needed for the optional traffic check
+        from concurrent.futures import ThreadPoolExecutor
+
         total = len(HEALTH_URLS)
         deadline = time.monotonic() + HEALTH_WAIT
         good: list[float] = []
@@ -823,7 +828,10 @@ def run_scanner(state, backend_factory, history, stop):
                 raise RuntimeError("No server locations found. Check MANUAL_LOCATIONS.")
 
         state.message = "Clearing any old tunnel"
-        state.tunnel_clean = backend.disconnect() is not False
+        if os.environ.get("EXPRESSO_ASSUME_CLEAN") == "1":
+            state.tunnel_clean = True  # the launcher already saw "Disconnected"
+        else:
+            state.tunnel_clean = backend.disconnect() is not False
         if VERIFY_TRAFFIC:
             state.message = "Detecting your real IP address"
             state.real_ip = backend.public_ip()

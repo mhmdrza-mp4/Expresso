@@ -17,7 +17,9 @@ $AppCandidates = @(
     'C:\Program Files\ExpressVPN\expressvpn-client.exe',
     'C:\Program Files (x86)\ExpressVPN\expressvpn-client.exe'
 )
-$Ctl = $CtlCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+# [IO.File]::Exists is faster than Test-Path / pipelines at startup.
+$Ctl = $null
+foreach ($p in $CtlCandidates) { if ([System.IO.File]::Exists($p)) { $Ctl = $p; break } }
 if (-not $Ctl) {
     $cmd = Get-Command expressvpnctl -ErrorAction SilentlyContinue
     if ($cmd) { $Ctl = $cmd.Source }
@@ -50,7 +52,8 @@ if ($state -eq 'Connected') {
 
 if (-not $state) {
     Write-Host 'Starting ExpressVPN...'
-    $appExe = $AppCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $appExe = $null
+    foreach ($p in $AppCandidates) { if ([System.IO.File]::Exists($p)) { $appExe = $p; break } }
     $usedFallback = $false
     if ($appExe) {
         Start-Process $appExe
@@ -62,7 +65,7 @@ if (-not $state) {
     $started  = Get-Date
     $deadline = $started.AddSeconds($Timeout)
     $fallbackAt = $started.AddSeconds($FallbackAfter)
-    while (-not (Get-VpnState)) {
+    while (-not ($state = Get-VpnState)) {
         $now = Get-Date
         if ($now -gt $deadline) {
             Write-Host "ExpressVPN not ready after $Timeout s." -ForegroundColor Red
@@ -76,9 +79,15 @@ if (-not $state) {
     }
 }
 
-$py   = if (Get-Command py -ErrorAction SilentlyContinue) { 'py' } else { 'python' }
+# The CLI already reported "Disconnected", so the script can skip its own initial disconnect.
+if ($state -eq 'Disconnected') { $env:EXPRESSO_ASSUME_CLEAN = '1' }
+
 $argv = @("`"$Script`"") + $args
-$proc = Start-Process -FilePath $py -ArgumentList $argv -NoNewWindow -PassThru
+try {
+    $proc = Start-Process -FilePath 'py' -ArgumentList $argv -NoNewWindow -PassThru
+} catch {
+    $proc = Start-Process -FilePath 'python' -ArgumentList $argv -NoNewWindow -PassThru
+}
 $null = $proc.Handle   # keep the handle so ExitCode stays readable
 
 $since = $null
