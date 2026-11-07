@@ -6,8 +6,6 @@ Fine-tune scanner, health-check, ranking, and launcher behavior here.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 APP_NAME = "Expresso"
 
 # --- connection -------------------------------------------------------------
@@ -39,7 +37,7 @@ IP_SERVICES = [
 ]
 
 # --- history / ranking ------------------------------------------------------
-HISTORY_FILE = Path.home() / ".expresso" / "history.db"
+# HISTORY_FILE (~/.expresso/history.db) is created lazily, see __getattr__ at the bottom.
 HISTORY_DAYS = 30  # attempts older than this are ignored
 HISTORY_KEEP = 20  # last N attempts per server are considered
 DECAY = 0.85  # newer attempts weigh more
@@ -78,3 +76,12 @@ APP_CANDIDATES = [
 ]
 
 USER_AGENT = "Expresso"
+
+
+def __getattr__(name):
+    # Lazy attribute: importing pathlib costs time, and the launcher does not need it.
+    if name == "HISTORY_FILE":
+        from pathlib import Path
+
+        return Path.home() / ".expresso" / "history.db"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

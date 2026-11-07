@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 
+T_START = time.time() * 1000  # ms, used by --trace
+
 from config import (
     APP_CANDIDATES,
     CLOSE_AFTER,
@@ -28,8 +30,133 @@ from config import (
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PASSTHROUGH_FLAGS = ("--demo", "--reset-history", "-h", "--help")
 
+# Draw a lightweight logo the moment Python starts, while the heavy imports load.
+# Only in Windows Terminal (it understands ANSI without any setup). Set to False to disable.
+SPLASH = True
+
+TRACE = "--trace" in sys.argv  # prints where the start-up time goes
+if TRACE:
+    sys.argv.remove("--trace")
+MARKS = []  # (label, ms)
+FIRST_FRAME = threading.Event()
+SPLASH_LINES = 0  # how many lines the splash occupies (0 = not drawn)
+
+
+def mark(label):
+    MARKS.append((label, time.time() * 1000))
+
+
+def trace_report():
+    if not TRACE:
+        return
+    try:
+        t0 = float(os.environ["EXPRESSO_T0"])
+    except (KeyError, ValueError):
+        t0 = T_START
+    print("\n--- trace (ms since command start) ---")
+    prev = t0
+    for label, ms in MARKS:
+        print(f"{label:<20} {ms - t0:7.0f}   (+{ms - prev:.0f})")
+        prev = ms
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Instant splash: plain ANSI, no imports, drawn before anything heavy is loaded.
+# ---------------------------------------------------------------------------
+_LOGO_BIG = [
+    "███████╗██╗  ██╗██████╗ ██████╗ ███████╗███████╗███████╗ ██████╗ ",
+    "██╔════╝╚██╗██╔╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝██╔═══██╗",
+    "█████╗   ╚███╔╝ ██████╔╝██████╔╝█████╗  ███████╗███████╗██║   ██║",
+    "██╔══╝   ██╔██╗ ██╔═══╝ ██╔══██╗██╔══╝  ╚════██║╚════██║██║   ██║",
+    "███████╗██╔╝ ██╗██║     ██║  ██║███████╗███████║███████║╚██████╔╝",
+    "╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝ ╚═════╝ ",
+]
+_LOGO_SMALL = [
+    "╔═╗═╗ ╦╔═╗╦═╗╔═╗╔═╗╔═╗╔═╗",
+    "║╣ ╔╩╦╝╠═╝╠╦╝║╣ ╚═╗╚═╗║ ║",
+    "╚═╝╩ ╚═╩  ╩╚═╚═╝╚═╝╚═╝╚═╝",
+]
+_STOPS = [(245, 222, 179), (251, 191, 36), (217, 119, 6), (146, 84, 40), (217, 119, 6), (251, 191, 36)]
+_INK = (24, 20, 18)
+
+
+def _gradient(pos):
+    pos -= int(pos)
+    x = pos * len(_STOPS)
+    i = int(x)
+    a, b, k = _STOPS[i % len(_STOPS)], _STOPS[(i + 1) % len(_STOPS)], x - i
+    return tuple(a[n] + (b[n] - a[n]) * k for n in range(3))
+
+
+def _paint_logo(art):
+    width = len(art[0])
+    out = []
+    for y, row in enumerate(art):
+        parts, prev = ["  "], None
+        for x, ch in enumerate(row):
+            if ch == " ":
+                parts.append(" ")
+                continue
+            c = _gradient((x + y * 1.6) / (width + 10))
+            if ch != "█":  # shadow strokes a shade darker
+                c = tuple(c[n] + (_INK[n] - c[n]) * 0.55 for n in range(3))
+            c = tuple(int(v) for v in c)
+            if c != prev:
+                parts.append("\x1b[38;2;%d;%d;%dm" % c)
+                prev = c
+            parts.append(ch)
+        out.append("".join(parts) + "\x1b[0m")
+    return out
+
+
+def _status_line(text):
+    return "  \x1b[38;2;128;120;112m" + text + "\x1b[0m"
+
+
+def draw_splash():
+    """Paint the logo and a status line at once. Returns False when it is not supported."""
+    global SPLASH_LINES
+    if not SPLASH or not sys.stdout.isatty():
+        return False
+    if os.name == "nt" and not os.environ.get("WT_SESSION"):
+        return False  # classic console: no ANSI until rich enables it later
+    try:
+        cols, rows = os.get_terminal_size()
+    except OSError:
+        return False
+    if cols >= 70 and rows >= 14:
+        art = _LOGO_BIG
+    elif cols >= 30 and rows >= 8:
+        art = _LOGO_SMALL
+    else:
+        return False
+    lines = _paint_logo(art) + ["", _status_line("checking ExpressVPN ...")]
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+    SPLASH_LINES = len(lines)
+    return True
+
+
+def set_status(text):
+    """Replace the splash status line (or just print when there is no splash)."""
+    if SPLASH_LINES:
+        sys.stdout.write("\x1b[1A\x1b[2K" + _status_line(text) + "\n")
+        sys.stdout.flush()
+    else:
+        print(text)
+
+
+def clear_splash():
+    global SPLASH_LINES
+    if SPLASH_LINES:
+        sys.stdout.write("\x1b[%dA\x1b[J" % SPLASH_LINES)
+        sys.stdout.flush()
+        SPLASH_LINES = 0
+
 
 def fail(message):
+    clear_splash()
     print(message)
     try:
         input("Enter to exit")
@@ -97,7 +224,7 @@ def start_app(app_path):
 
 def start_and_wait(ctl):
     """Open ExpressVPN and wait until its CLI answers. Returns the first state seen."""
-    print("Starting ExpressVPN...")
+    set_status("starting ExpressVPN ...")
     used_fallback = False
     app = next((p for p in APP_CANDIDATES if os.path.isfile(p)), None)
     try:
@@ -144,6 +271,7 @@ def quit_now():
 
 def watch(ctl):
     """Close this window CLOSE_AFTER seconds after the VPN is continuously connected."""
+    FIRST_FRAME.wait(timeout=3)  # no extra CLI processes while the first frame is being built
     since = None
     while True:
         time.sleep(POLL)
@@ -162,6 +290,18 @@ def run_expresso():
         import expresso
     except ImportError as exc:
         fail(f"{exc}\nInstall the requirements first:  pip install rich")
+    mark("expresso_imported")
+
+    original_render = expresso.render
+
+    def render_hook(state, console):
+        if not FIRST_FRAME.is_set():
+            mark("first_frame")
+            FIRST_FRAME.set()
+        return original_render(state, console)
+
+    expresso.render = render_hook
+    clear_splash()
     expresso.main()
 
 
@@ -170,16 +310,24 @@ def main():
         run_expresso()
         return
 
+    mark("launcher_started")
+    draw_splash()
+    mark("splash_drawn")
+
+    # The heavy imports are the longest task: start them first, then ask the CLI in parallel.
+    threading.Thread(target=preload, daemon=True).start()
+
     ctl = find_ctl()
     if not ctl:
         fail("expressvpnctl not found.")
+    os.environ["EXPRESSO_CTL"] = ctl  # lets expresso.py skip its own CLI search
 
-    # Start the CLI check and the heavy imports at the same time.
     check = spawn_state_check(ctl)
-    threading.Thread(target=preload, daemon=True).start()
     state = parse_state(check)
+    mark("cli_answered")
 
     if state and state.lower() == "connected":
+        clear_splash()
         print("Disconnecting...")
         try:
             subprocess.run(
@@ -190,6 +338,7 @@ def main():
             )
         except (subprocess.TimeoutExpired, OSError):
             pass
+        trace_report()
         sys.stdout.flush()
         os._exit(0)  # do not wait for the background import
 
@@ -201,8 +350,15 @@ def main():
             "1"  # skip Expresso's own initial disconnect
         )
 
-    threading.Thread(target=watch, args=(ctl,), daemon=True).start()
+    if not TRACE:  # in trace mode the window stays open until Ctrl+C
+        threading.Thread(target=watch, args=(ctl,), daemon=True).start()
     run_expresso()
+    if TRACE:
+        trace_report()
+        try:
+            input("Enter to exit")
+        except EOFError:
+            pass
 
 
 if __name__ == "__main__":

@@ -20,12 +20,9 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import random
-import shutil
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -324,10 +321,16 @@ class State:
 # ============================================================
 
 
+sqlite3 = None  # imported by History on first use (keeps start-up fast)
+
+
 class History:
     """Small SQLite store with every connection attempt ever made."""
 
     def __init__(self, path: Path):
+        global sqlite3
+        import sqlite3  # noqa: F811 - lazy: the UI must not wait for it
+
         self.path = path
         self.lock = threading.Lock()
         self.usable = True
@@ -344,10 +347,11 @@ class History:
                     "CREATE INDEX IF NOT EXISTS idx_attempts_loc "
                     "ON attempts(location, ts)"
                 )
-                c.execute(
-                    "DELETE FROM attempts WHERE ts < ?",
-                    (time.time() - HISTORY_DAYS * 2 * 86400,),
-                )
+                cutoff = time.time() - HISTORY_DAYS * 2 * 86400
+                if c.execute(
+                    "SELECT 1 FROM attempts WHERE ts < ? LIMIT 1", (cutoff,)
+                ).fetchone():
+                    c.execute("DELETE FROM attempts WHERE ts < ?", (cutoff,))
         except (sqlite3.Error, OSError):
             self.usable = False
 
@@ -488,6 +492,11 @@ def leaderboard(stats, limit=12):
 
 
 def find_cli():
+    hint = os.environ.get("EXPRESSO_CTL")  # set by launch.py
+    if hint:
+        return hint, ("ctl" if "expressvpnctl" in hint.lower() else "legacy")
+    import shutil  # lazy
+
     if shutil.which("expressvpnctl"):
         return "expressvpnctl", "ctl"
     if shutil.which("expressvpn"):
@@ -802,7 +811,7 @@ def attempt(state, backend, location, stop):
                     raise Fail("Server refused")
             else:
                 dead_since = None
-            stop.wait(0.15)
+            stop.wait(0.08)  # each poll is a CLI call anyway; a short gap only shaves detection latency
         state.stage_end(2, True)
         if not VERIFY_TRAFFIC:
             return True, time.monotonic() - started, None, "Connected"
@@ -1518,6 +1527,14 @@ def render(state, console):
 
 
 def parse_args():
+    argv = sys.argv[1:]
+    if all(a in ("--demo", "--reset-history") for a in argv):
+        # Fast path: no argparse import for the flags we know.
+        from types import SimpleNamespace
+
+        return SimpleNamespace(demo="--demo" in argv, reset_history="--reset-history" in argv)
+    import argparse  # lazy: only for --help, abbreviations, errors
+
     ap = argparse.ArgumentParser(
         description="Expresso - find and hold a working ExpressVPN server"
     )
@@ -1548,22 +1565,30 @@ def main():
     history_path = (
         HISTORY_FILE.with_name("history_demo.db") if args.demo else HISTORY_FILE
     )
-    history = History(history_path)
     if args.reset_history:
-        history.reset()
+        History(history_path).reset()
         console.print("[bold green]✔ Server history cleared.[/]")
         return
-    if args.demo:
-        # Same story on every demo run: fresh history, fixed server order.
-        history.reset()
-        random.seed(7)
 
     state = State()
     stop = threading.Event()
     factory = DemoBackend if args.demo else ExpressBackend
-    worker = threading.Thread(
-        target=run_scanner, args=(state, factory, history, stop), daemon=True
-    )
+
+    def scan():
+        # The history is opened here, not before the UI starts, so the first frame never waits for the disk.
+        try:
+            history = History(history_path)
+            if args.demo:
+                # Same story on every demo run: fresh history, fixed server order.
+                history.reset()
+                random.seed(7)
+        except Exception as exc:  # noqa: BLE001
+            state.error = str(exc) or exc.__class__.__name__
+            state.phase = "error"
+            return
+        run_scanner(state, factory, history, stop)
+
+    worker = threading.Thread(target=scan, daemon=True)
 
     interrupted = False
     try:
