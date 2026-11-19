@@ -923,6 +923,12 @@ def run_scanner(state, backend_factory, history, stop):
                         "ip_changed": health.ip_changed if health else None,
                     }
                     state.done_at = time.monotonic()
+                    try:
+                        from notify import notify_connected
+
+                        notify_connected(loc)
+                    except Exception:  # noqa: BLE001 - a notification must never break the run
+                        pass
                     state.phase = "connected"
                     return
 
