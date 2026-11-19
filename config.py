@@ -48,6 +48,15 @@ BENCH_AFTER = 2  # consecutive failures before a server is benched
 BENCH_BASE_MIN = 10  # first cool-down (minutes), doubles each extra failure
 BENCH_MAX_MIN = 360  # cool-down ceiling (minutes)
 
+# --- notification on connect (notify.py) ------------------------------------
+NOTIFY_SOUND = True  # play a Windows system sound when the VPN gets connected
+NOTIFY_SOUND_FILE = ""  # optional path to your own .wav ("" = pick a Windows sound)
+NOTIFY_POPUP = True  # animated card in the bottom-right corner of the screen
+NOTIFY_POPUP_SECS = 1.6  # how long the card stays (hover pauses it, click closes it)
+NOTIFY_POPUP_SCALE = 0.58  # card size: 1.0 = large, 0.8 = compact, 0.58 = small
+NOTIFY_FLASH = True  # blink the taskbar button until the window is brought forward
+NOTIFY_TOAST = False  # Windows toast (can be hidden by Focus Assist / app permissions)
+
 # --- UI ---------------------------------------------------------------------
 FPS = 20
 
