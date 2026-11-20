@@ -275,6 +275,13 @@ def watch(ctl):
     since = None
     while True:
         time.sleep(POLL)
+        # A server can be connected while Expresso is still testing it (quality check). The
+        # countdown only starts once Expresso has accepted it, otherwise the window could close
+        # before the check finishes - and before the notification.
+        accepted = getattr(sys.modules.get("expresso"), "ACCEPTED", None)
+        if accepted is not None and not accepted.is_set():
+            since = None
+            continue
         state = get_state(ctl)
         if state and state.lower() == "connected":
             if since is None:
