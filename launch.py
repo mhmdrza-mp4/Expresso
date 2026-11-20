@@ -22,6 +22,8 @@ from config import (
     APP_CANDIDATES,
     CLOSE_AFTER,
     CTL_CANDIDATES,
+    DISCONNECT_HOLD,
+    DISCONNECT_VISUAL,
     FALLBACK_AFTER,
     POLL,
     READY_TIMEOUT,
@@ -79,6 +81,7 @@ _LOGO_SMALL = [
 ]
 _STOPS = [(245, 222, 179), (251, 191, 36), (217, 119, 6), (146, 84, 40), (217, 119, 6), (251, 191, 36)]
 _INK = (24, 20, 18)
+_GREY = (96, 88, 80)
 
 
 def _gradient(pos):
@@ -89,7 +92,7 @@ def _gradient(pos):
     return tuple(a[n] + (b[n] - a[n]) * k for n in range(3))
 
 
-def _paint_logo(art):
+def _paint_logo(art, fade=0.0):
     width = len(art[0])
     out = []
     for y, row in enumerate(art):
@@ -101,6 +104,8 @@ def _paint_logo(art):
             c = _gradient((x + y * 1.6) / (width + 10))
             if ch != "█":  # shadow strokes a shade darker
                 c = tuple(c[n] + (_INK[n] - c[n]) * 0.55 for n in range(3))
+            if fade:
+                c = tuple(c[n] + (_GREY[n] - c[n]) * fade for n in range(3))
             c = tuple(int(v) for v in c)
             if c != prev:
                 parts.append("\x1b[38;2;%d;%d;%dm" % c)
@@ -153,6 +158,232 @@ def clear_splash():
         sys.stdout.write("\x1b[%dA\x1b[J" % SPLASH_LINES)
         sys.stdout.flush()
         SPLASH_LINES = 0
+
+
+def _mix(a, b, k):
+    k = max(0.0, min(1.0, k))
+    return tuple(int(a[n] + (b[n] - a[n]) * k) for n in range(3))
+
+
+def _fg(c, text, bold=False):
+    return "\x1b[%s38;2;%d;%d;%dm%s\x1b[0m" % (("1;" if bold else "",) + tuple(int(v) for v in c) + (text,))
+
+
+def _enable_vt():
+    """Make an old Windows console understand ANSI colours. True when it is ready."""
+    if os.name != "nt" or os.environ.get("WT_SESSION"):
+        return True
+    try:
+        import ctypes
+
+        kernel = ctypes.windll.kernel32
+        handle = kernel.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_GLYPHS = {
+    "D": ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "S": ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "N": ["███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"],
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+}  # fmt: skip
+
+
+def _word_art(word):
+    rows = [""] * 6
+    for ch in word:
+        glyph = _GLYPHS[ch]
+        width = max(len(r) for r in glyph)
+        rows = [rows[i] + glyph[i].ljust(width) for i in range(6)]
+    return rows
+
+
+def _hash01(a, b):
+    n = (a * 73856093) ^ (b * 19349663)
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return (n & 0xFFFF) / 65535.0
+
+
+_ROSE, _FUCHSIA = (244, 114, 182), (217, 70, 239)
+_LAV, _LAV_DIM = (130, 124, 150), (62, 56, 84)
+
+
+def _paint_art(row, y, fade, t):
+    """One line of the big word: Expresso amber gradient that cools down to lavender-grey."""
+    width = len(row)
+    parts, prev = [], None
+    for x, ch in enumerate(row):
+        if ch == " ":
+            parts.append(" ")
+            continue
+        c = _gradient((x + y * 1.6) / (width + 10) + t * 0.12)
+        if ch != "█":
+            c = tuple(c[n] + (_INK[n] - c[n]) * 0.55 for n in range(3))
+        c = _mix(c, _LAV_DIM if ch != "█" else _LAV, fade)
+        if c != prev:
+            parts.append("\x1b[38;2;%d;%d;%dm" % c)
+            prev = c
+        parts.append(ch)
+    return "".join(parts) + "\x1b[0m"
+
+
+def _disconnect_frame(rows, cols, p, finished, tick, t):
+    inner = cols - 4
+    body = rows - 2
+    fade = min(1.0, p * 1.25) if not finished else 1.0
+    spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    # ---- content block: (visible text, styled text) per line
+    lines = []
+    if cols >= 106 and rows >= 20:
+        for y, row in enumerate(_word_art("DISCONNECTED")):
+            lines.append((row, _paint_art(row, y, fade, t)))
+    else:
+        txt = "D I S C O N N E C T E D"
+        lines.append((txt, _fg(_mix((251, 191, 36), _LAV, fade), txt, True)))
+    lines.append(("", ""))
+
+    length = max(12, min(46, inner - 24))
+    gap = int(length * p)
+    left = (length - gap) // 2
+    right = length - gap - left
+    mid = _mix((74, 222, 128), _LAV, p * 1.6)
+    end_col = (74, 222, 128) if p < 1 else _LAV
+    gap_chars = [" "] * gap
+    if 0 < gap < length and not finished:
+        gap_chars[0] = "╌" if tick % 2 else " "
+        if gap >= 2:
+            gap_chars[-1] = "╌" if (tick // 2) % 2 else " "
+    tunnel = (
+        _fg(_LAV, "YOU ") + _fg(end_col, "●", True) + _fg(mid, "━" * left)
+        + _fg((251, 191, 36), "".join(gap_chars)) + _fg(mid, "━" * right)
+        + _fg(end_col, "◉", True) + _fg(_LAV, " NET")
+    )  # fmt: skip
+    lines.append((" " * (length + 10), tunnel))
+    lines.append(("", ""))
+    if finished:
+        a, b = "✔ DISCONNECTED", "  -  you are back on your normal connection"
+        if len(a + b) > inner:
+            b = ""
+        lines.append((a + b, _fg(_ROSE, a, True) + _fg(_LAV, b)))
+        hint = "run the launcher again to connect"
+        hint = hint[:inner]
+        lines.append(("", ""))
+        lines.append((hint, _fg(_LAV_DIM, hint)))
+    else:
+        s = spin[tick % len(spin)] + " closing the tunnel ..."
+        lines.append((s, _fg(_LAV, s)))
+
+    top_pad = max(0, (body - len(lines)) // 2)
+    content = {top_pad + i: line for i, line in enumerate(lines)}
+
+    # ---- falling embers on the rows the content does not use
+    stars = {}
+    for k in range(40):
+        x = int(_hash01(k, 1) * inner)
+        y0 = _hash01(k, 2) * body
+        speed = 1.2 + _hash01(k, 3) * 3.0
+        y = int((y0 + t * speed) % body)
+        if y in content:
+            continue
+        warm = _mix((251, 191, 36), _LAV_DIM, 0.35 + 0.65 * fade)
+        glyph = "•" if speed > 3 else "·"
+        stars.setdefault(y, {})[x] = (glyph, _mix(warm, _LAV_DIM, 0.4 if speed < 2 else 0.0))
+
+    border = _mix(_ROSE, _FUCHSIA, 0.5 + 0.5 * __import__("math").sin(t * 2)) if not finished else _LAV_DIM
+    title = " DISCONNECTED " if finished else " DISCONNECTING "
+    lt = (cols - 2 - len(title)) // 2
+    out = [
+        _fg(border, "╔" + "═" * lt) + _fg(_LAV if finished else _ROSE, title, True)
+        + _fg(border, "═" * (cols - 2 - lt - len(title)) + "╗")
+    ]  # fmt: skip
+    side = _fg(border, "║")
+    for r in range(body):
+        if r in content:
+            plain, styled = content[r]
+            lpad = max(0, (inner - len(plain)) // 2)
+            rpad = max(0, inner - lpad - len(plain))
+            out.append(side + " " + " " * lpad + styled + " " * rpad + " " + side)
+        else:
+            cells, row_stars = [], stars.get(r, {})
+            run = 0
+            for x in range(inner):
+                if x in row_stars:
+                    if run:
+                        cells.append(" " * run)
+                        run = 0
+                    cells.append(_fg(row_stars[x][1], row_stars[x][0]))
+                else:
+                    run += 1
+            if run:
+                cells.append(" " * run)
+            out.append(side + " " + "".join(cells) + " " + side)
+    out.append(_fg(border, "╚" + "═" * (cols - 2) + "╝"))
+    return out
+
+
+def disconnect_visual(ctl):
+    """Full-screen animation while `disconnect` runs. False = not supported here."""
+    if not DISCONNECT_VISUAL or not sys.stdout.isatty():
+        return False
+    if not _enable_vt():
+        return False
+    try:
+        cols, rows = os.get_terminal_size()
+    except OSError:
+        return False
+    if cols < 30 or rows < 10:
+        return False
+
+    out = sys.stdout
+    proc = subprocess.Popen(
+        [ctl, "disconnect"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=NO_WINDOW,
+    )
+    out.write("\x1b[?1049h\x1b[?25l")  # alternate screen, hide cursor
+    began = time.monotonic()
+    held_at = None
+    tick = 0
+    try:
+        while True:
+            elapsed = time.monotonic() - began
+            done = proc.poll() is not None or elapsed > 15
+            p = min(1.0, elapsed / 1.2)
+            if not done:
+                p = min(p, 0.9)
+            finished = done and p >= 1.0
+            try:
+                cols, rows = os.get_terminal_size()
+            except OSError:
+                pass
+            frame = _disconnect_frame(rows - 1, max(cols, 30), p, finished, tick, elapsed)
+            buf = []
+            for i, line in enumerate(frame):
+                buf.append("\x1b[%d;1H%s\x1b[K" % (i + 1, line))
+            buf.append("\x1b[%d;1H\x1b[J" % (len(frame) + 1))
+            out.write("".join(buf))
+            out.flush()
+            tick += 1
+            if finished:
+                held_at = held_at or time.monotonic()
+                if time.monotonic() - held_at >= DISCONNECT_HOLD:
+                    break
+            time.sleep(0.05)
+    finally:
+        out.write("\x1b[?1049l\x1b[?25h")
+        out.flush()
+    return True
 
 
 def fail(message):
@@ -335,16 +566,22 @@ def main():
 
     if state and state.lower() == "connected":
         clear_splash()
-        print("Disconnecting...")
         try:
-            subprocess.run(
-                [ctl, "disconnect"],
-                capture_output=True,
-                timeout=15,
-                creationflags=NO_WINDOW,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+            shown = disconnect_visual(ctl)
+        except Exception as exc:  # noqa: BLE001 - the visual is optional, the disconnect is not
+            print(f"(disconnect animation failed: {exc!r})")
+            shown = False
+        if not shown:
+            print("Disconnecting...")
+            try:
+                subprocess.run(
+                    [ctl, "disconnect"],
+                    capture_output=True,
+                    timeout=15,
+                    creationflags=NO_WINDOW,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         trace_report()
         sys.stdout.flush()
         os._exit(0)  # do not wait for the background import
