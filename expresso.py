@@ -7,9 +7,12 @@ works through the tunnel, and stays connected to the first server that passes.
 
   * Optional traffic check (VERIFY_TRAFFIC): after the tunnel is up, several
     HTTPS endpoints are probed and the public IP must change.
-  * Server history (SQLite): every attempt is remembered. Good servers are
-    tried first, unknown ones get a fair chance, and servers that keep failing
-    are put on hold for a while ("resting"), with a growing cool-down.
+  * Quality check (QUALITY_CHECK): after the tunnel is up, latency and download
+    speed are measured; weak servers are rejected and the next one is tried.
+  * Server history (SQLite): every attempt is remembered, including speed. The
+    order is a weighted random shuffle: fast, reliable servers come first most
+    of the time, unknown ones still get a fair chance, and servers that keep
+    failing are put on hold for a while ("resting"), with a growing cool-down.
   * Animated terminal UI (built on `rich`).
 
 Usage:
@@ -61,10 +64,21 @@ from config import (
     HISTORY_FILE,
     HISTORY_KEEP,
     IP_SERVICES,
-    JITTER,
     MANUAL_LOCATIONS,
+    PICK_SHARPNESS,
     PRIOR_RATE,
     PRIOR_WEIGHT,
+    FAST_PATH_CHANCE,
+    QUALITY_CHECK,
+    QUALITY_DOWNLOAD_BYTES,
+    QUALITY_DOWNLOAD_URL,
+    QUALITY_LATENCY_URL,
+    QUALITY_MAX_LATENCY_MS,
+    QUALITY_MAX_REJECTS,
+    QUALITY_MIN_MBPS,
+    QUALITY_PRIOR,
+    QUALITY_TIMEOUT,
+    QUALITY_WEIGHT,
     ROUND_PAUSE,
     USER_AGENT,
     VERIFY_TRAFFIC,
@@ -232,15 +246,19 @@ class ServerStat:
     score: float
     benched: bool
     recent: list  # newest first, list[bool]
+    avg_mbps: float | None = None
 
 
 STAGES_ALL = [
     ("RESET", "Clearing previous tunnel"),
     ("CONNECT", "Opening encrypted tunnel"),
     ("HANDSHAKE", "Waiting for the handshake"),
-    ("VERIFY", "Testing real internet traffic"),
+    (
+        "VERIFY",
+        "Testing real internet traffic" if VERIFY_TRAFFIC else "Checking speed and latency",
+    ),
 ]
-STAGES = STAGES_ALL if VERIFY_TRAFFIC else STAGES_ALL[:3]
+STAGES = STAGES_ALL if (VERIFY_TRAFFIC or QUALITY_CHECK) else STAGES_ALL[:3]
 N_STAGES = len(STAGES)
 
 
@@ -281,6 +299,9 @@ class State:
         self.tunnel_clean = (
             False  # True once a disconnect has completed and nothing connected since
         )
+        self.last_quality: tuple | None = None  # (latency_ms, mbps) of the latest attempt
+        self.quality_gate = QUALITY_CHECK  # switched off by the safety net
+        self.quality_rejects = 0
 
     # -- attempt bookkeeping ---------------------------------------------
     def begin_attempt(self, location):
@@ -290,6 +311,7 @@ class State:
         self.stage_time = [None] * N_STAGES
         self.stage_detail = [None] * N_STAGES
         self.fail_reason = None
+        self.last_quality = None
         self.message = "Preparing probe"
 
     def stage_begin(self, i):
@@ -324,6 +346,13 @@ class State:
 sqlite3 = None  # imported by History on first use (keeps start-up fast)
 
 
+def weighted_avg(pairs):
+    """Weighted mean of (value, weight) pairs; entries without a value are ignored."""
+    good = [(v, w) for v, w in pairs if v]
+    total = sum(w for _, w in good)
+    return sum(v * w for v, w in good) / total if total else None
+
+
 class History:
     """Small SQLite store with every connection attempt ever made."""
 
@@ -341,8 +370,12 @@ class History:
                     "CREATE TABLE IF NOT EXISTS attempts ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
                     "location TEXT NOT NULL, ok INTEGER NOT NULL, "
-                    "connect_time REAL, latency_ms REAL, ip TEXT, reason TEXT)"
+                    "connect_time REAL, latency_ms REAL, ip TEXT, reason TEXT, mbps REAL)"
                 )
+                try:  # databases created by older versions have no speed column
+                    c.execute("ALTER TABLE attempts ADD COLUMN mbps REAL")
+                except sqlite3.OperationalError:
+                    pass
                 c.execute(
                     "CREATE INDEX IF NOT EXISTS idx_attempts_loc "
                     "ON attempts(location, ts)"
@@ -365,15 +398,15 @@ class History:
             finally:
                 conn.close()
 
-    def record(self, location, ok, connect_time, latency_ms, ip, reason):
+    def record(self, location, ok, connect_time, latency_ms, ip, reason, mbps=None):
         if not self.usable:
             return
         try:
             with self._db() as c:
                 c.execute(
                     "INSERT INTO attempts "
-                    "(ts, location, ok, connect_time, latency_ms, ip, reason) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    "(ts, location, ok, connect_time, latency_ms, ip, reason, mbps) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
                     (
                         time.time(),
                         location,
@@ -382,6 +415,7 @@ class History:
                         latency_ms,
                         ip,
                         reason,
+                        mbps,
                     ),
                 )
         except sqlite3.Error:
@@ -394,18 +428,23 @@ class History:
             c.execute("DELETE FROM attempts")
 
     def last_success(self):
-        """Most recent server that connected and has not failed since."""
+        """Most recent server that connected, was not weak, and has not failed since."""
         if not self.usable:
             return None
         try:
             with self._db() as c:
                 row = c.execute(
-                    "SELECT location, ts FROM attempts WHERE ok = 1 AND ts > ? "
+                    "SELECT location, ts, latency_ms, mbps FROM attempts WHERE ok = 1 AND ts > ? "
                     "ORDER BY ts DESC LIMIT 1",
                     (time.time() - HISTORY_DAYS * 86400,),
                 ).fetchone()
                 if not row:
                     return None
+                if QUALITY_CHECK and (
+                    (row[2] and row[2] > QUALITY_MAX_LATENCY_MS)
+                    or (row[3] is not None and row[3] < QUALITY_MIN_MBPS)
+                ):
+                    return None  # it connected, but it was weak: do not rush back to it
                 failed_since = c.execute(
                     "SELECT 1 FROM attempts WHERE location = ? AND ok = 0 AND ts > ? LIMIT 1",
                     (row[0], row[1]),
@@ -420,7 +459,7 @@ class History:
         try:
             with self._db() as c:
                 rows = c.execute(
-                    "SELECT location, ok, latency_ms, ts FROM attempts "
+                    "SELECT location, ok, latency_ms, ts, mbps FROM attempts "
                     "WHERE ts > ? ORDER BY ts DESC",
                     (time.time() - HISTORY_DAYS * 86400,),
                 ).fetchall()
@@ -428,9 +467,9 @@ class History:
             return {}
 
         per: dict[str, list] = defaultdict(list)
-        for loc, ok, lat, ts in rows:
+        for loc, ok, lat, ts, mbps in rows:
             if len(per[loc]) < HISTORY_KEEP:
-                per[loc].append((bool(ok), lat, ts))
+                per[loc].append((bool(ok), lat, ts, mbps))
 
         now = time.time()
         out: dict[str, ServerStat] = {}
@@ -439,8 +478,10 @@ class History:
             wsum = sum(weights)
             wok = sum(w for w, it in zip(weights, items) if it[0])
             rate = (wok + PRIOR_RATE * PRIOR_WEIGHT) / (wsum + PRIOR_WEIGHT)
-            lats = [it[1] for it in items if it[0] and it[1]]
-            avg_lat = sum(lats) / len(lats) if lats else None
+            # Speed counts even when the server was rejected for being slow, and
+            # newer measurements weigh more.
+            avg_lat = weighted_avg([(it[1], w) for it, w in zip(items, weights)])
+            avg_mbps = weighted_avg([(it[3], w) for it, w in zip(items, weights)])
             streak = 0
             for it in items:
                 if it[0]:
@@ -453,7 +494,12 @@ class History:
                     BENCH_BASE_MIN * 2 ** (streak - BENCH_AFTER), BENCH_MAX_MIN
                 )
                 benched = (now - last_ts) < cooldown * 60
-            lat_score = 1 / (1 + avg_lat / 400) if avg_lat else 0.45
+            parts = []
+            if avg_lat:
+                parts.append(1 / (1 + avg_lat / 250))  # 100 ms -> 0.71, 400 ms -> 0.38
+            if avg_mbps is not None:
+                parts.append(avg_mbps / (avg_mbps + 10))  # 5 Mbps -> 0.33, 30 Mbps -> 0.75
+            quality = sum(parts) / len(parts) if parts else QUALITY_PRIOR
             out[loc] = ServerStat(
                 location=loc,
                 attempts=len(items),
@@ -461,24 +507,37 @@ class History:
                 avg_latency=avg_lat,
                 streak=streak,
                 last_ts=last_ts,
-                score=0.75 * rate + 0.25 * lat_score,
+                score=(1 - QUALITY_WEIGHT) * rate + QUALITY_WEIGHT * quality,
                 benched=benched,
                 recent=[it[0] for it in items[:8]],
+                avg_mbps=avg_mbps,
             )
         return out
 
 
+def weighted_shuffle(scored):
+    """[(score, loc)] -> locations in random order; a higher score is likelier to come early.
+
+    Weighted sampling without replacement: every server draws u ** (1 / weight) and the
+    list is sorted by that number. PICK_SHARPNESS decides how strongly the score matters.
+    """
+    keyed = []
+    for score, loc in scored:
+        weight = max(score, 0.01) ** PICK_SHARPNESS
+        keyed.append((random.random() ** (1.0 / weight), loc))
+    keyed.sort(reverse=True)
+    return [loc for _, loc in keyed]
+
+
 def order_locations(locations, stats):
-    """Best-known first, unknown ones mixed in fairly, benched ones last."""
-    unknown_score = 0.75 * PRIOR_RATE + 0.25 * 0.45
+    """Fast, reliable servers usually first, unknown ones mixed in fairly, benched ones last."""
+    unknown_score = (1 - QUALITY_WEIGHT) * PRIOR_RATE + QUALITY_WEIGHT * QUALITY_PRIOR
     active, benched = [], []
     for loc in locations:
         st = stats.get(loc)
-        score = (st.score if st else unknown_score) + random.uniform(0, JITTER)
+        score = st.score if st else unknown_score
         (benched if st and st.benched else active).append((score, loc))
-    active.sort(reverse=True)
-    benched.sort(reverse=True)
-    return [loc for _, loc in active] + [loc for _, loc in benched], len(benched)
+    return weighted_shuffle(active) + weighted_shuffle(benched), len(benched)
 
 
 def leaderboard(stats, limit=12):
@@ -613,6 +672,75 @@ class ExpressBackend:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    def measure_quality(self, stop):
+        """Return (latency_ms, mbps) through the tunnel; None for a part that failed."""
+        import http.client  # lazy
+        import socket
+        from urllib.parse import urlsplit
+
+        headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
+
+        def split(url):
+            u = urlsplit(url)
+            return u.netloc, (u.path or "/") + (("?" + u.query) if u.query else "")
+
+        def latency():
+            host, path = split(QUALITY_LATENCY_URL)
+            conn = http.client.HTTPSConnection(host, timeout=QUALITY_TIMEOUT)
+            try:
+                conn.request("GET", path, headers=headers)  # warm-up: DNS + TCP + TLS
+                conn.getresponse().read()
+                best = None
+                for _ in range(2):
+                    started = time.perf_counter()
+                    conn.request("GET", path, headers=headers)
+                    conn.getresponse().read()
+                    ms = (time.perf_counter() - started) * 1000
+                    best = ms if best is None else min(best, ms)
+                return best
+            except Exception:  # noqa: BLE001
+                return None
+            finally:
+                conn.close()
+
+        def speed():
+            host, path = split(QUALITY_DOWNLOAD_URL.format(bytes=QUALITY_DOWNLOAD_BYTES))
+            conn = http.client.HTTPSConnection(host, timeout=QUALITY_TIMEOUT)
+            try:
+                conn.connect()
+            except Exception:  # noqa: BLE001
+                conn.close()
+                return None  # endpoint unreachable: say nothing about the server
+            got, began = 0, time.perf_counter()
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    return None
+                began = time.perf_counter()  # count from the first byte, not the round trip
+                while got < QUALITY_DOWNLOAD_BYTES:
+                    chunk = resp.read(32768)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if time.perf_counter() - began > QUALITY_TIMEOUT:
+                        break
+            except (socket.timeout, TimeoutError):
+                if got == 0:
+                    return 0.0  # connected, but no data arrived in time
+            except Exception:  # noqa: BLE001
+                if got == 0:
+                    return None
+            finally:
+                conn.close()
+            seconds = max(time.perf_counter() - began, 0.001)
+            return got * 8 / seconds / 1e6
+
+        ms = latency()
+        if stop.is_set() or (ms is not None and ms > QUALITY_MAX_LATENCY_MS):
+            return ms, None  # clearly too slow already: do not waste time on the download
+        return ms, speed()
+
     def public_ip(self, timeout=2.5):
         import ipaddress  # lazy: only needed for the optional traffic check
         import urllib.request
@@ -720,6 +848,7 @@ class DemoBackend:
 
     def connect(self, location):
         time.sleep(random.uniform(0.8, 1.5))
+        self.loc = location
         self.attempts += 1
         if self.attempts <= len(self.FAIL_PLAN):
             self.plan = self.FAIL_PLAN[self.attempts - 1]
@@ -740,6 +869,11 @@ class DemoBackend:
 
     def poll(self):
         return "connected" if self.is_connected() else "connecting"
+
+    def measure_quality(self, stop):
+        time.sleep(random.uniform(0.4, 0.9))
+        q = self.quality.get(getattr(self, "loc", ""), 0.5)
+        return 60 + (1 - q) * 420 + random.uniform(-15, 15), 1 + q * 60
 
     def public_ip(self, timeout=2.5):
         time.sleep(0.4)
@@ -769,6 +903,18 @@ class Fail(Exception):
 
 class Stopped(Exception):
     pass
+
+
+def quality_verdict(quality):
+    """None when the measured quality is good enough, otherwise the reason it is not."""
+    lat, mbps = quality
+    if lat is None and mbps is None:
+        return "No response through tunnel"
+    if lat is not None and lat > QUALITY_MAX_LATENCY_MS:
+        return f"Too slow: {lat:.0f} ms latency"
+    if mbps is not None and mbps < QUALITY_MIN_MBPS:
+        return f"Too slow: {mbps:.1f} Mbps"
+    return None
 
 
 def attempt(state, backend, location, stop):
@@ -813,19 +959,38 @@ def attempt(state, backend, location, stop):
                 dead_since = None
             stop.wait(0.08)  # each poll is a CLI call anyway; a short gap only shaves detection latency
         state.stage_end(2, True)
-        if not VERIFY_TRAFFIC:
+        if len(STAGES) < 4:  # neither the traffic check nor the quality check is on
             return True, time.monotonic() - started, None, "Connected"
 
         stage = 3
         state.stage_begin(3)
-        health = backend.health(state.real_ip, stop)
-        if stop.is_set():
-            raise Stopped
-        if not health.ok:
-            raise Fail(health.reason)
-        state.stage_end(
-            3, True, f"{health.passed}/{health.total} · {health.latency:.0f}ms"
-        )
+        details = []
+        if VERIFY_TRAFFIC:
+            health = backend.health(state.real_ip, stop)
+            if stop.is_set():
+                raise Stopped
+            if not health.ok:
+                raise Fail(health.reason)
+            details.append(f"{health.passed}/{health.total}")
+        if QUALITY_CHECK and state.quality_gate:
+            quality = backend.measure_quality(stop)
+            if stop.is_set():
+                raise Stopped
+            state.last_quality = quality
+            verdict = quality_verdict(quality)
+            if verdict:
+                state.quality_rejects += 1
+                if state.quality_rejects >= QUALITY_MAX_REJECTS:
+                    state.quality_gate = False  # safety net: stop being picky this run
+                raise Fail(verdict)
+            lat, mbps = quality
+            if lat is not None:
+                details.append(f"{lat:.0f}ms")
+            if mbps is not None:
+                details.append(f"{mbps:.1f}Mbps")
+        elif QUALITY_CHECK:
+            details.append("check skipped")
+        state.stage_end(3, True, " · ".join(details) or None)
         return True, time.monotonic() - started, health, "Connected"
 
     except Stopped:
@@ -850,7 +1015,9 @@ def run_scanner(state, backend_factory, history, stop):
         backend = backend_factory()
 
         # Fast path: try the last server that worked before listing all locations.
-        preferred = None if MANUAL_LOCATIONS else history.last_success()
+        # (only some of the time, so the pick stays random)
+        use_fast = random.random() < FAST_PATH_CHANCE
+        preferred = None if (MANUAL_LOCATIONS or not use_fast) else history.last_success()
         locations = None
         skip = None
         if preferred is None:
@@ -890,9 +1057,10 @@ def run_scanner(state, backend_factory, history, stop):
                 state.begin_attempt(loc)
                 ok, seconds, health, reason = attempt(state, backend, loc, stop)
 
-                latency = health.latency if health else None
+                q_lat, q_mbps = state.last_quality or (None, None)
+                latency = q_lat if q_lat is not None else (health.latency if health else None)
                 ip = health.ip if health else None
-                history.record(loc, ok, seconds, latency, ip, reason)
+                history.record(loc, ok, seconds, latency, ip, reason, q_mbps)
 
                 state.tested += 1
                 state.completed += 1
@@ -905,6 +1073,7 @@ def run_scanner(state, backend_factory, history, stop):
                         "ok": ok,
                         "seconds": seconds,
                         "latency": latency,
+                        "mbps": q_mbps,
                         "ip": ip,
                         "reason": reason,
                         "ts": time.monotonic(),
@@ -918,6 +1087,7 @@ def run_scanner(state, backend_factory, history, stop):
                         "ip": ip,
                         "seconds": seconds,
                         "latency": latency,
+                        "mbps": q_mbps,
                         "passed": health.passed if health else None,
                         "total": health.total if health else None,
                         "ip_changed": health.ip_changed if health else None,
@@ -1289,7 +1459,8 @@ def render_log(state, rows, border):
         base = fg(C_TEXT, bold=fresh, dim=dim)
         if e["ok"]:
             res = Text("✔ LIVE", fg(C_GREEN, bold=True))
-            detail = Text(e["ip"] or "ip unavailable", fg(C_GREEN, dim=dim))
+            speed = f"{e['mbps']:.1f} Mbps" if e.get("mbps") is not None else None
+            detail = Text(e["ip"] or speed or "ip unavailable", fg(C_GREEN, dim=dim))
         else:
             res = Text("✘ FAIL", fg(C_RED, bold=fresh, dim=dim))
             detail = Text(e["reason"], fg(C_MUTED, dim=dim))
@@ -1458,6 +1629,10 @@ def render_success(state, console, t, final=False):
             ("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-"),
             ("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed"),
         ]
+    if r.get("passed") is None and r.get("latency"):
+        items.append(("LATENCY", f"{r['latency']:.0f} ms"))
+    if r.get("mbps") is not None:
+        items.append(("SPEED", f"{r['mbps']:.1f} Mbps"))
     items += [
         ("CONNECT TIME", f"{r.get('seconds', 0):.2f} s"),
         ("SERVERS TRIED", f"{state.tested}  ({state.failed} failed)"),
