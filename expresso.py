@@ -85,6 +85,10 @@ from config import (
     WIN_CANDIDATES,
 )
 
+# Set the moment a server has been accepted (after the quality check). launch.py waits for it
+# before it starts counting down to close the window.
+ACCEPTED = threading.Event()
+
 # ============================================================
 #                    COLOR / DRAWING HELPERS
 # ============================================================
@@ -1093,6 +1097,7 @@ def run_scanner(state, backend_factory, history, stop):
                         "ip_changed": health.ip_changed if health else None,
                     }
                     state.done_at = time.monotonic()
+                    ACCEPTED.set()
                     try:
                         from notify import notify_connected
 
