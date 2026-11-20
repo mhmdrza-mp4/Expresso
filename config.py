@@ -43,10 +43,32 @@ HISTORY_KEEP = 20  # last N attempts per server are considered
 DECAY = 0.85  # newer attempts weigh more
 PRIOR_RATE = 0.60  # optimistic guess for servers we know nothing about
 PRIOR_WEIGHT = 2.0  # how strongly that guess counts
-JITTER = 0.06  # small randomness so the order isn't fully fixed
 BENCH_AFTER = 2  # consecutive failures before a server is benched
 BENCH_BASE_MIN = 10  # first cool-down (minutes), doubles each extra failure
 BENCH_MAX_MIN = 360  # cool-down ceiling (minutes)
+
+# --- quality: prefer fast servers -------------------------------------------
+# After a server connects, Expresso measures latency and download speed through
+# the tunnel. Servers that are clearly weak are rejected on the spot and the next
+# one is tried. Every measurement is stored, so strong servers climb the ranking.
+QUALITY_CHECK = True  # False = old behaviour (any server that connects is accepted)
+QUALITY_LATENCY_URL = "https://www.gstatic.com/generate_204"
+QUALITY_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
+QUALITY_DOWNLOAD_BYTES = 600_000  # small test file; a bigger one is more accurate but slower
+QUALITY_TIMEOUT = 3.0  # seconds: cap for each measurement (a weak server costs at most ~this)
+QUALITY_MAX_LATENCY_MS = 300  # slower than this -> rejected (round trip through the tunnel)
+QUALITY_MIN_MBPS = 2.0  # slower than this -> rejected (short test, so keep it low)
+QUALITY_MAX_REJECTS = 6  # after this many rejections the check switches off for this run
+#                          (safety net: your own internet may just be slow)
+QUALITY_WEIGHT = 0.6  # share of the ranking score that comes from speed (rest = reliability)
+QUALITY_PRIOR = 0.5  # assumed speed score for servers that were never measured
+
+# --- how the next server is picked ------------------------------------------
+# Weighted random order: a better score means a much higher chance to be tried
+# early, but nothing is fixed. 0 = pure random, 3 = leans to the best, 6+ = almost
+# always the best. Weak/unknown servers still get an occasional turn.
+PICK_SHARPNESS = 5.0
+FAST_PATH_CHANCE = 0.5  # chance to retry the last good server first (skips listing servers)
 
 # --- notification on connect (notify.py) ------------------------------------
 NOTIFY_SOUND = True  # play a Windows system sound when the VPN gets connected
