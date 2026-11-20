@@ -1098,6 +1098,7 @@ def run_scanner(state, backend_factory, history, stop):
                     }
                     state.done_at = time.monotonic()
 <<<<<<< HEAD
+<<<<<<< HEAD
                     ACCEPTED.set()
                     try:
                         from notify import notify_connected
@@ -1105,6 +1106,8 @@ def run_scanner(state, backend_factory, history, stop):
                         notify_connected(loc)
                     except Exception:  # noqa: BLE001 - a notification must never break the run
                         pass
+=======
+>>>>>>> parent of 2301a93 (feat: notify on connect)
 =======
 >>>>>>> parent of 2301a93 (feat: notify on connect)
                     state.phase = "connected"
