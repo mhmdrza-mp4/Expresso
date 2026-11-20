@@ -2,17 +2,15 @@
 """
 Expresso
 
-Tests ExpressVPN locations one by one, verifies that real internet traffic
-works through the tunnel, and stays connected to the first server that passes.
+Tests ExpressVPN locations one by one and stays connected to the first server that
+completes the handshake.
 
-  * Optional traffic check (VERIFY_TRAFFIC): after the tunnel is up, several
-    HTTPS endpoints are probed and the public IP must change.
-  * Quality check (QUALITY_CHECK): after the tunnel is up, latency and download
-    speed are measured; weak servers are rejected and the next one is tried.
-  * Server history (SQLite): every attempt is remembered, including speed. The
-    order is a weighted random shuffle: fast, reliable servers come first most
-    of the time, unknown ones still get a fair chance, and servers that keep
-    failing are put on hold for a while ("resting"), with a growing cool-down.
+  * Server history (SQLite): every attempt is remembered. Servers that connected
+    before are tried first, country by country in the order of COUNTRY_PRIORITY
+    (config.py), the most reliable ones first inside each country. When none of
+    them works any more, the remaining servers are tried the same way (best
+    country first, random inside it). Servers that keep failing are put on hold
+    for a while ("resting"), with a growing cool-down.
   * Animated terminal UI (built on `rich`).
 
 Usage:
@@ -53,39 +51,24 @@ from config import (
     BENCH_MAX_MIN,
     CONNECT_TIMEOUT,
     CONNECT_WAIT,
+    COUNTRY_ALIASES,
+    COUNTRY_PRIORITY,
     DECAY,
     EARLY_FAIL_SECS,
+    FAST_PATH_CHANCE,
     FPS,
-    HEALTH_MIN_PASS,
-    HEALTH_TIMEOUT,
-    HEALTH_URLS,
-    HEALTH_WAIT,
     HISTORY_DAYS,
     HISTORY_FILE,
     HISTORY_KEEP,
-    IP_SERVICES,
     MANUAL_LOCATIONS,
     PICK_SHARPNESS,
     PRIOR_RATE,
     PRIOR_WEIGHT,
-    FAST_PATH_CHANCE,
-    QUALITY_CHECK,
-    QUALITY_DOWNLOAD_BYTES,
-    QUALITY_DOWNLOAD_URL,
-    QUALITY_LATENCY_URL,
-    QUALITY_MAX_LATENCY_MS,
-    QUALITY_MAX_REJECTS,
-    QUALITY_MIN_MBPS,
-    QUALITY_PRIOR,
-    QUALITY_TIMEOUT,
-    QUALITY_WEIGHT,
     ROUND_PAUSE,
-    USER_AGENT,
-    VERIFY_TRAFFIC,
     WIN_CANDIDATES,
 )
 
-# Set the moment a server has been accepted (after the quality check). launch.py waits for it
+# Set the moment a server has been accepted (once the handshake is done). launch.py waits for it
 # before it starts counting down to close the window.
 ACCEPTED = threading.Event()
 
@@ -93,18 +76,20 @@ ACCEPTED = threading.Event()
 #                    COLOR / DRAWING HELPERS
 # ============================================================
 
-C_CYAN = (34, 211, 238)
-C_BLUE = (96, 165, 250)
-C_VIOLET = (167, 139, 250)
-C_PINK = (244, 114, 182)
+# "Dusk" theme: rose, fuchsia and indigo around the amber Expresso logo.
+# The names are historical (CYAN is now rose, VIOLET fuchsia, ...).
+C_CYAN = (244, 114, 182)
+C_BLUE = (99, 102, 241)
+C_VIOLET = (217, 70, 239)
+C_PINK = (253, 164, 175)
 C_GREEN = (74, 222, 128)
-C_TEAL = (45, 212, 191)
+C_TEAL = (163, 230, 53)
 C_RED = (248, 113, 113)
 C_AMBER = (251, 191, 36)
-C_TEXT = (229, 231, 235)
-C_MUTED = (107, 114, 128)
-C_DIM = (55, 65, 81)
-C_TRACK = (31, 41, 55)
+C_TEXT = (236, 232, 245)
+C_MUTED = (130, 124, 150)
+C_DIM = (62, 56, 84)
+C_TRACK = (30, 27, 46)
 WHITE = (255, 255, 255)
 
 LOGO_STOPS = [
@@ -115,7 +100,7 @@ LOGO_STOPS = [
     (217, 119, 6),
     (251, 191, 36),
 ]
-OK_STOPS = [C_GREEN, C_TEAL, C_CYAN, C_TEAL]
+OK_STOPS = [C_GREEN, C_TEAL, C_AMBER, C_TEAL]
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -229,17 +214,6 @@ def smooth_bar(ratio, width, t, c1, c2, shimmer=True):
 
 
 @dataclass
-class HealthResult:
-    ok: bool
-    latency: float | None = None  # median ms of the successful probes
-    passed: int = 0
-    total: int = 0
-    ip: str | None = None
-    ip_changed: bool | None = None
-    reason: str = ""
-
-
-@dataclass
 class ServerStat:
     location: str
     attempts: int
@@ -250,19 +224,14 @@ class ServerStat:
     score: float
     benched: bool
     recent: list  # newest first, list[bool]
-    avg_mbps: float | None = None
+    successes: int = 0
 
 
-STAGES_ALL = [
+STAGES = [
     ("RESET", "Clearing previous tunnel"),
     ("CONNECT", "Opening encrypted tunnel"),
     ("HANDSHAKE", "Waiting for the handshake"),
-    (
-        "VERIFY",
-        "Testing real internet traffic" if VERIFY_TRAFFIC else "Checking speed and latency",
-    ),
 ]
-STAGES = STAGES_ALL if (VERIFY_TRAFFIC or QUALITY_CHECK) else STAGES_ALL[:3]
 N_STAGES = len(STAGES)
 
 
@@ -298,14 +267,13 @@ class State:
 
         self.log: deque = deque(maxlen=80)
         self.board: list[ServerStat] = []
+        self.route: list[str] = []  # country codes in the order they will be tried
+        self.route_tried: set[str] = set()  # countries with a failed attempt this round
         self.real_ip: str | None = None
         self.result: dict | None = None
         self.tunnel_clean = (
             False  # True once a disconnect has completed and nothing connected since
         )
-        self.last_quality: tuple | None = None  # (latency_ms, mbps) of the latest attempt
-        self.quality_gate = QUALITY_CHECK  # switched off by the safety net
-        self.quality_rejects = 0
 
     # -- attempt bookkeeping ---------------------------------------------
     def begin_attempt(self, location):
@@ -315,7 +283,6 @@ class State:
         self.stage_time = [None] * N_STAGES
         self.stage_detail = [None] * N_STAGES
         self.fail_reason = None
-        self.last_quality = None
         self.message = "Preparing probe"
 
     def stage_begin(self, i):
@@ -357,6 +324,16 @@ def weighted_avg(pairs):
     return sum(v * w for v, w in good) / total if total else None
 
 
+# Old versions of Expresso also logged servers that connected but were rejected for being
+# slow (or failed a traffic check). Those rows are not real failures: ignore them.
+_IGNORED = (
+    " AND COALESCE(reason, '') NOT LIKE 'Too slow%'"
+    " AND COALESCE(reason, '') NOT LIKE 'No real traffic%'"
+    " AND COALESCE(reason, '') NOT LIKE 'IP unchanged%'"
+    " AND COALESCE(reason, '') != 'No response through tunnel'"
+)
+
+
 class History:
     """Small SQLite store with every connection attempt ever made."""
 
@@ -376,10 +353,6 @@ class History:
                     "location TEXT NOT NULL, ok INTEGER NOT NULL, "
                     "connect_time REAL, latency_ms REAL, ip TEXT, reason TEXT, mbps REAL)"
                 )
-                try:  # databases created by older versions have no speed column
-                    c.execute("ALTER TABLE attempts ADD COLUMN mbps REAL")
-                except sqlite3.OperationalError:
-                    pass
                 c.execute(
                     "CREATE INDEX IF NOT EXISTS idx_attempts_loc "
                     "ON attempts(location, ts)"
@@ -402,25 +375,15 @@ class History:
             finally:
                 conn.close()
 
-    def record(self, location, ok, connect_time, latency_ms, ip, reason, mbps=None):
+    def record(self, location, ok, connect_time, reason):
         if not self.usable:
             return
         try:
             with self._db() as c:
                 c.execute(
-                    "INSERT INTO attempts "
-                    "(ts, location, ok, connect_time, latency_ms, ip, reason, mbps) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        time.time(),
-                        location,
-                        int(ok),
-                        connect_time,
-                        latency_ms,
-                        ip,
-                        reason,
-                        mbps,
-                    ),
+                    "INSERT INTO attempts (ts, location, ok, connect_time, reason) "
+                    "VALUES (?,?,?,?,?)",
+                    (time.time(), location, int(ok), connect_time, reason),
                 )
         except sqlite3.Error:
             pass
@@ -432,25 +395,22 @@ class History:
             c.execute("DELETE FROM attempts")
 
     def last_success(self):
-        """Most recent server that connected, was not weak, and has not failed since."""
+        """Most recent server that connected and has not failed since."""
         if not self.usable:
             return None
         try:
             with self._db() as c:
                 row = c.execute(
-                    "SELECT location, ts, latency_ms, mbps FROM attempts WHERE ok = 1 AND ts > ? "
+                    "SELECT location, ts FROM attempts WHERE ok = 1 AND ts > ? "
                     "ORDER BY ts DESC LIMIT 1",
                     (time.time() - HISTORY_DAYS * 86400,),
                 ).fetchone()
                 if not row:
                     return None
-                if QUALITY_CHECK and (
-                    (row[2] and row[2] > QUALITY_MAX_LATENCY_MS)
-                    or (row[3] is not None and row[3] < QUALITY_MIN_MBPS)
-                ):
-                    return None  # it connected, but it was weak: do not rush back to it
                 failed_since = c.execute(
-                    "SELECT 1 FROM attempts WHERE location = ? AND ok = 0 AND ts > ? LIMIT 1",
+                    "SELECT 1 FROM attempts WHERE location = ? AND ok = 0 AND ts > ?"
+                    + _IGNORED
+                    + " LIMIT 1",
                     (row[0], row[1]),
                 ).fetchone()
                 return None if failed_since else row[0]
@@ -463,17 +423,17 @@ class History:
         try:
             with self._db() as c:
                 rows = c.execute(
-                    "SELECT location, ok, latency_ms, ts, mbps FROM attempts "
-                    "WHERE ts > ? ORDER BY ts DESC",
+                    "SELECT location, ok, latency_ms, ts FROM attempts "
+                    "WHERE ts > ?" + _IGNORED + " ORDER BY ts DESC",
                     (time.time() - HISTORY_DAYS * 86400,),
                 ).fetchall()
         except sqlite3.Error:
             return {}
 
         per: dict[str, list] = defaultdict(list)
-        for loc, ok, lat, ts, mbps in rows:
+        for loc, ok, lat, ts in rows:
             if len(per[loc]) < HISTORY_KEEP:
-                per[loc].append((bool(ok), lat, ts, mbps))
+                per[loc].append((bool(ok), lat, ts))
 
         now = time.time()
         out: dict[str, ServerStat] = {}
@@ -482,10 +442,7 @@ class History:
             wsum = sum(weights)
             wok = sum(w for w, it in zip(weights, items) if it[0])
             rate = (wok + PRIOR_RATE * PRIOR_WEIGHT) / (wsum + PRIOR_WEIGHT)
-            # Speed counts even when the server was rejected for being slow, and
-            # newer measurements weigh more.
             avg_lat = weighted_avg([(it[1], w) for it, w in zip(items, weights)])
-            avg_mbps = weighted_avg([(it[3], w) for it, w in zip(items, weights)])
             streak = 0
             for it in items:
                 if it[0]:
@@ -498,12 +455,6 @@ class History:
                     BENCH_BASE_MIN * 2 ** (streak - BENCH_AFTER), BENCH_MAX_MIN
                 )
                 benched = (now - last_ts) < cooldown * 60
-            parts = []
-            if avg_lat:
-                parts.append(1 / (1 + avg_lat / 250))  # 100 ms -> 0.71, 400 ms -> 0.38
-            if avg_mbps is not None:
-                parts.append(avg_mbps / (avg_mbps + 10))  # 5 Mbps -> 0.33, 30 Mbps -> 0.75
-            quality = sum(parts) / len(parts) if parts else QUALITY_PRIOR
             out[loc] = ServerStat(
                 location=loc,
                 attempts=len(items),
@@ -511,10 +462,10 @@ class History:
                 avg_latency=avg_lat,
                 streak=streak,
                 last_ts=last_ts,
-                score=(1 - QUALITY_WEIGHT) * rate + QUALITY_WEIGHT * quality,
+                score=rate,
                 benched=benched,
                 recent=[it[0] for it in items[:8]],
-                avg_mbps=avg_mbps,
+                successes=sum(1 for it in items if it[0]),
             )
         return out
 
@@ -533,15 +484,86 @@ def weighted_shuffle(scored):
     return [loc for _, loc in keyed]
 
 
+COUNTRY_RANK = {name: i for i, name in enumerate(COUNTRY_PRIORITY)}
+UNKNOWN_RANK = len(COUNTRY_PRIORITY)
+
+
+def country_key(location):
+    """Canonical name from COUNTRY_PRIORITY ("usa", "hong-kong", ...) or None."""
+    import re  # lazy
+
+    parts = re.sub(r"[^a-z0-9]+", "-", location.lower()).strip("-").split("-")
+    for n in range(len(parts), 0, -1):  # longest prefix first: "hong-kong-2" -> "hong-kong"
+        key = "-".join(parts[:n])
+        key = COUNTRY_ALIASES.get(key, key)
+        if key in COUNTRY_RANK:
+            return key
+    return None
+
+
+def country_rank(location):
+    """0 = best country in COUNTRY_PRIORITY; UNKNOWN_RANK = country not in the list."""
+    key = country_key(location)
+    return COUNTRY_RANK[key] if key else UNKNOWN_RANK
+
+
+COUNTRY_CODES = {
+    "usa": "US", "uk": "UK", "germany": "DE", "netherlands": "NL", "canada": "CA",
+    "france": "FR", "sweden": "SE", "switzerland": "CH", "spain": "ES", "italy": "IT",
+    "belgium": "BE", "denmark": "DK", "norway": "NO", "finland": "FI", "austria": "AT",
+    "ireland": "IE", "poland": "PL", "czech-republic": "CZ", "luxembourg": "LU",
+    "romania": "RO", "singapore": "SG", "japan": "JP", "hong-kong": "HK",
+    "australia": "AU", "south-korea": "KR", "taiwan": "TW", "turkey": "TR",
+    "uae": "AE", "portugal": "PT", "hungary": "HU", "bulgaria": "BG", "greece": "GR",
+}  # fmt: skip
+
+
+def _first_word(location):
+    import re  # lazy
+
+    return (re.sub(r"[^a-z0-9]+", "-", location.lower()).strip("-").split("-") or [""])[0]
+
+
+def country_label(location):
+    """Short country code for the UI: "USA - Miami" -> "US"."""
+    key = country_key(location)
+    if key:
+        return COUNTRY_CODES.get(key, key[:2].upper())
+    return _first_word(location)[:2].upper() or "??"
+
+
+def country_name(location):
+    key = country_key(location)
+    if key:
+        return key.upper() if len(key) <= 3 else key.replace("-", " ").title()
+    return _first_word(location).title() or "Unknown"
+
+
 def order_locations(locations, stats):
-    """Fast, reliable servers usually first, unknown ones mixed in fairly, benched ones last."""
-    unknown_score = (1 - QUALITY_WEIGHT) * PRIOR_RATE + QUALITY_WEIGHT * QUALITY_PRIOR
-    active, benched = [], []
+    """Proven servers first, then untried ones, resting ones last.
+
+    Inside each group: best country first (COUNTRY_PRIORITY); inside a country a weighted
+    random shuffle (reliable servers lean to the front, unknown ones sit in the middle).
+    """
+    groups = ([], [], [])  # proven (connected before), unproven, resting
     for loc in locations:
         st = stats.get(loc)
-        score = st.score if st else unknown_score
-        (benched if st and st.benched else active).append((score, loc))
-    return weighted_shuffle(active) + weighted_shuffle(benched), len(benched)
+        if st and st.benched:
+            g = 2
+        elif st and st.successes:
+            g = 0
+        else:
+            g = 1
+        groups[g].append((country_rank(loc), st.score if st else PRIOR_RATE, loc))
+
+    ordered = []
+    for group in groups:
+        by_country = defaultdict(list)
+        for rank, score, loc in group:
+            by_country[rank].append((score, loc))
+        for rank in sorted(by_country):
+            ordered += weighted_shuffle(by_country[rank])
+    return ordered, len(groups[2])
 
 
 def leaderboard(stats, limit=12):
@@ -586,24 +608,6 @@ def run_cli(cli, args, timeout=30):
     )
     output = (result.stdout + "\n" + result.stderr).strip()
     return output, result.returncode
-
-
-def probe(url, timeout):
-    """Return the response time in ms, or None when the probe failed."""
-    import urllib.request  # lazy: only needed for the optional traffic check
-
-    started = time.monotonic()
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read(256)
-            if resp.status in (200, 204):
-                return (time.monotonic() - started) * 1000
-    except Exception:
-        pass
-    return None
 
 
 class ExpressBackend:
@@ -676,131 +680,6 @@ class ExpressBackend:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
-    def measure_quality(self, stop):
-        """Return (latency_ms, mbps) through the tunnel; None for a part that failed."""
-        import http.client  # lazy
-        import socket
-        from urllib.parse import urlsplit
-
-        headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
-
-        def split(url):
-            u = urlsplit(url)
-            return u.netloc, (u.path or "/") + (("?" + u.query) if u.query else "")
-
-        def latency():
-            host, path = split(QUALITY_LATENCY_URL)
-            conn = http.client.HTTPSConnection(host, timeout=QUALITY_TIMEOUT)
-            try:
-                conn.request("GET", path, headers=headers)  # warm-up: DNS + TCP + TLS
-                conn.getresponse().read()
-                best = None
-                for _ in range(2):
-                    started = time.perf_counter()
-                    conn.request("GET", path, headers=headers)
-                    conn.getresponse().read()
-                    ms = (time.perf_counter() - started) * 1000
-                    best = ms if best is None else min(best, ms)
-                return best
-            except Exception:  # noqa: BLE001
-                return None
-            finally:
-                conn.close()
-
-        def speed():
-            host, path = split(QUALITY_DOWNLOAD_URL.format(bytes=QUALITY_DOWNLOAD_BYTES))
-            conn = http.client.HTTPSConnection(host, timeout=QUALITY_TIMEOUT)
-            try:
-                conn.connect()
-            except Exception:  # noqa: BLE001
-                conn.close()
-                return None  # endpoint unreachable: say nothing about the server
-            got, began = 0, time.perf_counter()
-            try:
-                conn.request("GET", path, headers=headers)
-                resp = conn.getresponse()
-                if resp.status != 200:
-                    return None
-                began = time.perf_counter()  # count from the first byte, not the round trip
-                while got < QUALITY_DOWNLOAD_BYTES:
-                    chunk = resp.read(32768)
-                    if not chunk:
-                        break
-                    got += len(chunk)
-                    if time.perf_counter() - began > QUALITY_TIMEOUT:
-                        break
-            except (socket.timeout, TimeoutError):
-                if got == 0:
-                    return 0.0  # connected, but no data arrived in time
-            except Exception:  # noqa: BLE001
-                if got == 0:
-                    return None
-            finally:
-                conn.close()
-            seconds = max(time.perf_counter() - began, 0.001)
-            return got * 8 / seconds / 1e6
-
-        ms = latency()
-        if stop.is_set() or (ms is not None and ms > QUALITY_MAX_LATENCY_MS):
-            return ms, None  # clearly too slow already: do not waste time on the download
-        return ms, speed()
-
-    def public_ip(self, timeout=2.5):
-        import ipaddress  # lazy: only needed for the optional traffic check
-        import urllib.request
-
-        for url in IP_SERVICES:
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    text = resp.read(64).decode(errors="ignore").strip()
-                ipaddress.ip_address(text)
-                return text
-            except Exception:
-                continue
-        return None
-
-    def health(self, real_ip, stop):
-        """Probe several endpoints in parallel until enough of them answer."""
-        import statistics  # lazy: only needed for the optional traffic check
-        from concurrent.futures import ThreadPoolExecutor
-
-        total = len(HEALTH_URLS)
-        deadline = time.monotonic() + HEALTH_WAIT
-        good: list[float] = []
-        with ThreadPoolExecutor(total) as pool:
-            while True:
-                results = list(
-                    pool.map(lambda u: probe(u, HEALTH_TIMEOUT), HEALTH_URLS)
-                )
-                good = [r for r in results if r is not None]
-                if len(good) >= HEALTH_MIN_PASS:
-                    break
-                if stop.is_set() or time.monotonic() >= deadline:
-                    return HealthResult(
-                        False,
-                        None,
-                        len(good),
-                        total,
-                        reason=f"No real traffic ({len(good)}/{total} probes)",
-                    )
-                stop.wait(0.6)
-
-        ip = self.public_ip()
-        changed = None if (ip is None or real_ip is None) else ip != real_ip
-        if changed is False:
-            return HealthResult(
-                False,
-                None,
-                len(good),
-                total,
-                ip,
-                False,
-                reason="IP unchanged - tunnel not routing",
-            )
-        return HealthResult(
-            True, statistics.median(good), len(good), total, ip, changed
-        )
 
 
 class DemoBackend:
@@ -840,8 +719,6 @@ class DemoBackend:
     ]
 
     def __init__(self):
-        rnd = random.Random(11)
-        self.quality = {n: rnd.random() ** 1.5 * 0.9 + 0.04 for n in self.NAMES}
         self.plan = "ok"
         self.connected_at = 0.0
         self.attempts = 0
@@ -874,26 +751,6 @@ class DemoBackend:
     def poll(self):
         return "connected" if self.is_connected() else "connecting"
 
-    def measure_quality(self, stop):
-        time.sleep(random.uniform(0.4, 0.9))
-        q = self.quality.get(getattr(self, "loc", ""), 0.5)
-        return 60 + (1 - q) * 420 + random.uniform(-15, 15), 1 + q * 60
-
-    def public_ip(self, timeout=2.5):
-        time.sleep(0.4)
-        return ".".join(str(random.randint(11, 220)) for _ in range(4))
-
-    def health(self, real_ip, stop):
-        time.sleep(random.uniform(0.9, 1.7))
-        if self.plan == "health":
-            return HealthResult(
-                False,
-                None,
-                random.choice([0, 1]),
-                3,
-                reason="No real traffic (0/3 probes)",
-            )
-        return HealthResult(True, random.uniform(55, 320), 3, 3, self.public_ip(), True)
 
 
 # ============================================================
@@ -909,22 +766,9 @@ class Stopped(Exception):
     pass
 
 
-def quality_verdict(quality):
-    """None when the measured quality is good enough, otherwise the reason it is not."""
-    lat, mbps = quality
-    if lat is None and mbps is None:
-        return "No response through tunnel"
-    if lat is not None and lat > QUALITY_MAX_LATENCY_MS:
-        return f"Too slow: {lat:.0f} ms latency"
-    if mbps is not None and mbps < QUALITY_MIN_MBPS:
-        return f"Too slow: {mbps:.1f} Mbps"
-    return None
-
-
 def attempt(state, backend, location, stop):
-    """Run the stages for one server. Returns (ok, seconds, health, reason)."""
+    """Run the stages for one server. Returns (ok, seconds, reason)."""
     started = time.monotonic()
-    health = None
     stage = 0
     try:
         state.stage_begin(0)
@@ -963,39 +807,7 @@ def attempt(state, backend, location, stop):
                 dead_since = None
             stop.wait(0.08)  # each poll is a CLI call anyway; a short gap only shaves detection latency
         state.stage_end(2, True)
-        if len(STAGES) < 4:  # neither the traffic check nor the quality check is on
-            return True, time.monotonic() - started, None, "Connected"
-
-        stage = 3
-        state.stage_begin(3)
-        details = []
-        if VERIFY_TRAFFIC:
-            health = backend.health(state.real_ip, stop)
-            if stop.is_set():
-                raise Stopped
-            if not health.ok:
-                raise Fail(health.reason)
-            details.append(f"{health.passed}/{health.total}")
-        if QUALITY_CHECK and state.quality_gate:
-            quality = backend.measure_quality(stop)
-            if stop.is_set():
-                raise Stopped
-            state.last_quality = quality
-            verdict = quality_verdict(quality)
-            if verdict:
-                state.quality_rejects += 1
-                if state.quality_rejects >= QUALITY_MAX_REJECTS:
-                    state.quality_gate = False  # safety net: stop being picky this run
-                raise Fail(verdict)
-            lat, mbps = quality
-            if lat is not None:
-                details.append(f"{lat:.0f}ms")
-            if mbps is not None:
-                details.append(f"{mbps:.1f}Mbps")
-        elif QUALITY_CHECK:
-            details.append("check skipped")
-        state.stage_end(3, True, " · ".join(details) or None)
-        return True, time.monotonic() - started, health, "Connected"
+        return True, time.monotonic() - started, "Connected"
 
     except Stopped:
         raise
@@ -1010,7 +822,7 @@ def attempt(state, backend, location, stop):
     state.fail_reason = reason
     state.message = reason
     state.tunnel_clean = backend.disconnect() is not False
-    return False, time.monotonic() - started, health, reason
+    return False, time.monotonic() - started, reason
 
 
 def run_scanner(state, backend_factory, history, stop):
@@ -1019,9 +831,21 @@ def run_scanner(state, backend_factory, history, stop):
         backend = backend_factory()
 
         # Fast path: try the last server that worked before listing all locations.
-        # (only some of the time, so the pick stays random)
-        use_fast = random.random() < FAST_PATH_CHANCE
-        preferred = None if (MANUAL_LOCATIONS or not use_fast) else history.last_success()
+        # Only some of the time, and only when it sits in the best country that has a
+        # proven server, so the country priority is respected.
+        preferred = None
+        if not MANUAL_LOCATIONS and random.random() < FAST_PATH_CHANCE:
+            preferred = history.last_success()
+            if preferred is not None:
+                proven = [
+                    loc
+                    for loc, st in history.load().items()
+                    if st.successes and not st.benched
+                ]
+                if not proven or country_rank(preferred) > min(
+                    country_rank(loc) for loc in proven
+                ):
+                    preferred = None
         locations = None
         skip = None
         if preferred is None:
@@ -1035,9 +859,6 @@ def run_scanner(state, backend_factory, history, stop):
             state.tunnel_clean = True  # the launcher already saw "Disconnected"
         else:
             state.tunnel_clean = backend.disconnect() is not False
-        if VERIFY_TRAFFIC:
-            state.message = "Detecting your real IP address"
-            state.real_ip = backend.public_ip()
 
         state.phase = "scanning"
         while not stop.is_set():
@@ -1054,31 +875,31 @@ def run_scanner(state, backend_factory, history, stop):
             state.benched = benched
             state.known = len(stats)
             state.board = leaderboard(stats)
+            state.route = list(dict.fromkeys(country_label(l) for l in ordered))
+            state.route_tried = set()
 
             for loc in ordered:
                 if stop.is_set():
                     raise Stopped
                 state.begin_attempt(loc)
-                ok, seconds, health, reason = attempt(state, backend, loc, stop)
+                ok, seconds, reason = attempt(state, backend, loc, stop)
 
-                q_lat, q_mbps = state.last_quality or (None, None)
-                latency = q_lat if q_lat is not None else (health.latency if health else None)
-                ip = health.ip if health else None
-                history.record(loc, ok, seconds, latency, ip, reason, q_mbps)
+                history.record(loc, ok, seconds, reason)
 
                 state.tested += 1
                 state.completed += 1
                 if not ok:
                     state.failed += 1
+                    state.route_tried.add(country_label(loc))
                 state.add_log(
                     {
                         "n": state.tested,
                         "location": loc,
                         "ok": ok,
                         "seconds": seconds,
-                        "latency": latency,
-                        "mbps": q_mbps,
-                        "ip": ip,
+                        "latency": None,
+                        "mbps": None,
+                        "ip": None,
                         "reason": reason,
                         "ts": time.monotonic(),
                     }
@@ -1088,17 +909,15 @@ def run_scanner(state, backend_factory, history, stop):
                 if ok:
                     state.result = {
                         "location": loc,
-                        "ip": ip,
+                        "ip": None,
                         "seconds": seconds,
-                        "latency": latency,
-                        "mbps": q_mbps,
-                        "passed": health.passed if health else None,
-                        "total": health.total if health else None,
-                        "ip_changed": health.ip_changed if health else None,
+                        "latency": None,
+                        "mbps": None,
+                        "passed": None,
+                        "total": None,
+                        "ip_changed": None,
                     }
                     state.done_at = time.monotonic()
-<<<<<<< HEAD
-<<<<<<< HEAD
                     ACCEPTED.set()
                     try:
                         from notify import notify_connected
@@ -1106,10 +925,6 @@ def run_scanner(state, backend_factory, history, stop):
                         notify_connected(loc)
                     except Exception:  # noqa: BLE001 - a notification must never break the run
                         pass
-=======
->>>>>>> parent of 2301a93 (feat: notify on connect)
-=======
->>>>>>> parent of 2301a93 (feat: notify on connect)
                     state.phase = "connected"
                     return
 
@@ -1141,6 +956,7 @@ def run_scanner(state, backend_factory, history, stop):
     except Exception as exc:  # noqa: BLE001
         state.error = str(exc) or exc.__class__.__name__
         state.phase = "error"
+
 
 
 # ============================================================
@@ -1268,7 +1084,40 @@ def render_tunnel(state, t, length):
     return out
 
 
-SHORT_NAMES = ["RESET", "CONNECT", "SHAKE", "VERIFY"][:N_STAGES]
+SHORT_NAMES = ["RESET", "CONNECT", "SHAKE"]
+
+
+def render_route(state, t, width):
+    """ROUTE  ◆US ▸ UK ▸ DE ▸ NL ...  the countries in the order they are tried."""
+    out = Text(no_wrap=True, overflow="crop")
+    out.append("ROUTE  ", fg(C_MUTED))
+    route = state.route
+    if not route:
+        out.append("building the list…", fg(C_MUTED))
+        return out
+    done = state.phase == "connected"
+    active = country_label(state.location) if state.location else None
+    if done and state.result:
+        active = country_label(state.result["location"])
+    idx = route.index(active) if active in route else 0
+    slots = max(2, (width - 10) // 6)
+    start = max(0, min(idx - 1, len(route) - slots))
+    if start > 0:
+        out.append("… ", fg(C_MUTED))
+    for i in range(start, min(len(route), start + slots)):
+        lab = route[i]
+        if lab == active:
+            col = C_GREEN if done else lerp(C_CYAN, WHITE, 0.55 * pulse(t, 6))
+            out.append("◆" + lab, fg(col, bold=True))
+        elif lab in state.route_tried:
+            out.append(lab, fg(C_RED, dim=True))
+        else:
+            out.append(lab, fg(C_MUTED))
+        if i < min(len(route), start + slots) - 1:
+            out.append(" ▸ ", fg(C_DIM))
+    if start + slots < len(route):
+        out.append(" …", fg(C_MUTED))
+    return out
 
 
 def stage_cell(state, i, t, short=False):
@@ -1351,7 +1200,7 @@ def render_target(state, t, w, compact, border):
         status.append(f"{state.message}{dots}", fg(C_MUTED))
 
     gap = Text("")
-    body = [head, name]
+    body = [head, name, render_route(state, t, inner)]
     if not compact:
         body.append(gap)
     body.append(render_tunnel(state, t, tunnel_len))
@@ -1450,7 +1299,7 @@ def render_log(state, rows, border):
     table.add_column("SERVER", ratio=3, no_wrap=True, overflow="ellipsis")
     table.add_column("RESULT", width=8, no_wrap=True)
     table.add_column("TIME", width=6, justify="right", no_wrap=True)
-    table.add_column("PING", width=7, justify="right", no_wrap=True)
+    table.add_column("CC", width=4, justify="center", no_wrap=True)
     table.add_column("DETAIL", ratio=3, no_wrap=True, overflow="ellipsis")
 
     entries = list(reversed(state.log_snapshot()))[:rows]
@@ -1470,18 +1319,17 @@ def render_log(state, rows, border):
         base = fg(C_TEXT, bold=fresh, dim=dim)
         if e["ok"]:
             res = Text("✔ LIVE", fg(C_GREEN, bold=True))
-            speed = f"{e['mbps']:.1f} Mbps" if e.get("mbps") is not None else None
-            detail = Text(e["ip"] or speed or "ip unavailable", fg(C_GREEN, dim=dim))
+            detail = Text("handshake ok", fg(C_GREEN, dim=dim))
         else:
             res = Text("✘ FAIL", fg(C_RED, bold=fresh, dim=dim))
             detail = Text(e["reason"], fg(C_MUTED, dim=dim))
-        ping = f"{e['latency']:.0f}ms" if e["latency"] else "-"
+        cc = country_label(e["location"])
         table.add_row(
             Text(str(e["n"]), fg(C_MUTED, dim=dim)),
             Text(e["location"], base),
             res,
             Text(f"{e['seconds']:.1f}s", fg(C_MUTED, dim=dim)),
-            Text(ping, fg(C_MUTED, dim=dim)),
+            Text(cc, fg(C_CYAN, dim=dim)),
             detail,
         )
     return panel(table, "LIVE LOG", border, subtitle="newest first", padding=(0, 1))
@@ -1499,7 +1347,7 @@ def render_board(state, rows, border):
     table.add_column("#", width=2, justify="right", no_wrap=True)
     table.add_column("SERVER", ratio=3, no_wrap=True, overflow="ellipsis")
     table.add_column("HIT", width=4, justify="right", no_wrap=True)
-    table.add_column("PING", width=6, justify="right", no_wrap=True)
+    table.add_column("OK", width=5, justify="right", no_wrap=True)
     table.add_column("TREND", width=6, no_wrap=True)
 
     board = state.board[:rows]
@@ -1527,7 +1375,7 @@ def render_board(state, rows, border):
             Text(str(i), fg(C_MUTED)),
             name,
             Text(f"{st.rate:.0%}", fg(col, bold=True)),
-            Text(f"{st.avg_latency:.0f}ms" if st.avg_latency else "-", fg(C_MUTED)),
+            Text(f"{st.successes}/{st.attempts}", fg(C_MUTED)),
             trend,
         )
     return panel(
@@ -1550,8 +1398,38 @@ def render_footer(state, w=120):
     return foot
 
 
+def render_mini(state, console, t):
+    """Tiny terminal: one small panel with the essentials."""
+    w, h = console.size
+    inner = max(10, w - 6)
+    border = border_color(state, t)
+    head = Text(no_wrap=True, overflow="ellipsis")
+    head.append("◆ ", fg(C_CYAN, bold=True))
+    head.append(state.location or "waiting…", fg(C_TEXT, bold=True))
+    status = Text(no_wrap=True, overflow="ellipsis")
+    if state.fail_reason and state.location:
+        status.append("✘ " + state.fail_reason, fg(C_RED))
+    else:
+        status.append(state.message + "." * (int(t * 2.5) % 4), fg(C_MUTED))
+    if state.phase == "pause":
+        ratio = state.pause_left / max(1, state.pause_total)
+    else:
+        ratio = state.completed / state.total if state.total else 0
+    bar = smooth_bar(ratio, max(6, inner - 5), t, C_CYAN, C_VIOLET)
+    bar.append(f" {ratio:>4.0%}", fg(C_TEXT, bold=True))
+    return Panel(
+        Group(head, render_route(state, t, inner), status, bar),
+        title=Text(f" {APP_NAME.upper()} ", style=fg(C_TEXT, bold=True)),
+        border_style=border,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
 def render_dashboard(state, console, t):
     w, h = console.size
+    if h < 20 or w < 56:
+        return render_mini(state, console, t)
     compact = h < 34 or w < 72
     header_h = 3 if compact else 9
     top_h = 10 if compact else 12
@@ -1621,30 +1499,14 @@ def starfield(width, rows, t, y0=0, density=0.04):
 def render_success(state, console, t, final=False):
     w, h = console.size
     r = state.result or {}
+    since = 99.0 if (final or not state.done_at) else time.monotonic() - state.done_at
     art = ART_CONNECTED if w >= 86 else ART_ONLINE
     art_text = gradient_text(art, t, stops=OK_STOPS, shadow=True, speed=0.3)
 
-    items = [("SERVER", r.get("location", "-"))]
-    if r.get("passed") is not None:
-        changed = r.get("ip_changed")
-        items += [
-            ("PUBLIC IP", r.get("ip") or "unavailable"),
-            (
-                "IP CHANGED",
-                (
-                    Text("yes - traffic is tunnelled", fg(C_GREEN, bold=True))
-                    if changed
-                    else Text("could not compare", fg(C_MUTED))
-                ),
-            ),
-            ("LATENCY", f"{r['latency']:.0f} ms" if r.get("latency") else "-"),
-            ("HEALTH CHECK", f"{r.get('passed', 0)}/{r.get('total', 0)} probes passed"),
-        ]
-    if r.get("passed") is None and r.get("latency"):
-        items.append(("LATENCY", f"{r['latency']:.0f} ms"))
-    if r.get("mbps") is not None:
-        items.append(("SPEED", f"{r['mbps']:.1f} Mbps"))
-    items += [
+    loc = r.get("location", "-")
+    items = [
+        ("SERVER", loc),
+        ("COUNTRY", f"{country_name(loc)} ({country_label(loc)})"),
         ("CONNECT TIME", f"{r.get('seconds', 0):.2f} s"),
         ("SERVERS TRIED", f"{state.tested}  ({state.failed} failed)"),
         (
@@ -1675,14 +1537,19 @@ def render_success(state, console, t, final=False):
     total_h = max(10, h - 3) if final else h
     inner_w = max(20, w - 6)
     note_lines = -(-len(note_text) // inner_w)
-    content_h = len(art) + 1 + 1 + 1 + len(items) + 1 + note_lines
+    route_h = 2  # blank + route line
+    content_h = len(art) + 1 + 1 + 1 + len(items) + 1 + note_lines + route_h
     free = (total_h - 2) - content_h
     top = max(0, free // 2)
     bottom = max(0, free - top)
 
+    # A burst of sparkles for the first moments after the connection.
+    burst = max(0.0, 1 - since / 1.6)
+    density = 0.04 + 0.30 * burst
+
     pieces = []
     if top:
-        pieces.append(starfield(inner_w, top, t, y0=0))
+        pieces.append(starfield(inner_w, top, t, y0=0, density=density))
     pieces += [
         Align.center(art_text),
         Text(""),
@@ -1690,12 +1557,14 @@ def render_success(state, console, t, final=False):
         Text(""),
         Align.center(rows),
         Text(""),
+        Align.center(render_route(state, t, inner_w)),
+        Text(""),
         note,
     ]
     if bottom:
-        pieces.append(starfield(inner_w, bottom, t, y0=top + 50))
+        pieces.append(starfield(inner_w, bottom, t, y0=top + 50, density=density))
 
-    border = hx(C_GREEN if final else lerp(C_GREEN, C_CYAN, pulse(t, 2)))
+    border = hx(lerp(C_GREEN, WHITE, burst * 0.8) if (final or burst) else lerp(C_GREEN, C_AMBER, pulse(t, 2)))
     return Panel(
         Group(*pieces),
         title=Text(" CONNECTION SUCCESSFUL ", style=fg(C_GREEN, bold=True)),
