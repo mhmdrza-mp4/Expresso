@@ -1,7 +1,7 @@
 """
 Expresso Configuration
 
-Fine-tune scanner, health-check, ranking, and launcher behavior here.
+Fine-tune scanner, ranking, country priority, and launcher behavior here.
 """
 
 from __future__ import annotations
@@ -17,25 +17,6 @@ EARLY_FAIL_SECS = (
 ROUND_PAUSE = 30  # pause between full rounds when every server failed
 MANUAL_LOCATIONS: list[str] = []  # e.g. ["germany-frankfurt-1", "uk-london"]
 
-# --- health check (optional) ------------------------------------------------
-# Off by default: a server counts as "connected" as soon as the VPN reports it.
-# Turn it on to also require real internet traffic through the tunnel; servers
-# that connect but fail this check are then skipped.
-VERIFY_TRAFFIC = False
-HEALTH_URLS = [
-    "https://www.gstatic.com/generate_204",
-    "https://cp.cloudflare.com/generate_204",
-    "https://www.msftconnecttest.com/connecttest.txt",
-]
-HEALTH_MIN_PASS = 2  # how many of the URLs must answer
-HEALTH_TIMEOUT = 2.5  # seconds per probe
-HEALTH_WAIT = 5.0  # total seconds we keep retrying the check
-IP_SERVICES = [
-    "https://api.ipify.org",
-    "https://ifconfig.me/ip",
-    "https://icanhazip.com",
-]
-
 # --- history / ranking ------------------------------------------------------
 # HISTORY_FILE (~/.expresso/history.db) is created lazily, see __getattr__ at the bottom.
 HISTORY_DAYS = 30  # attempts older than this are ignored
@@ -47,28 +28,78 @@ BENCH_AFTER = 2  # consecutive failures before a server is benched
 BENCH_BASE_MIN = 10  # first cool-down (minutes), doubles each extra failure
 BENCH_MAX_MIN = 360  # cool-down ceiling (minutes)
 
-# --- quality: prefer fast servers -------------------------------------------
-# After a server connects, Expresso measures latency and download speed through
-# the tunnel. Servers that are clearly weak are rejected on the spot and the next
-# one is tried. Every measurement is stored, so strong servers climb the ranking.
-QUALITY_CHECK = True  # False = old behaviour (any server that connects is accepted)
-QUALITY_LATENCY_URL = "https://www.gstatic.com/generate_204"
-QUALITY_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
-QUALITY_DOWNLOAD_BYTES = 600_000  # small test file; a bigger one is more accurate but slower
-QUALITY_TIMEOUT = 3.0  # seconds: cap for each measurement (a weak server costs at most ~this)
-QUALITY_MAX_LATENCY_MS = 300  # slower than this -> rejected (round trip through the tunnel)
-QUALITY_MIN_MBPS = 2.0  # slower than this -> rejected (short test, so keep it low)
-QUALITY_MAX_REJECTS = 6  # after this many rejections the check switches off for this run
-#                          (safety net: your own internet may just be slow)
-QUALITY_WEIGHT = 0.6  # share of the ranking score that comes from speed (rest = reliability)
-QUALITY_PRIOR = 0.5  # assumed speed score for servers that were never measured
+# --- country priority --------------------------------------------------------
+# Countries are tried in this order (best first). The order is a judgement call based on
+# how large and well connected ExpressVPN's server clusters are, and how stable their
+# links tend to be; ExpressVPN does not publish a per-country ranking. Edit freely.
+# Names are matched against the start of the location name, so "usa" also covers
+# "usa-new-york", "usa-miami", ... and "germany" covers "germany-frankfurt-1".
+# Countries that are not in the list are tried after all of these.
+COUNTRY_PRIORITY = [
+    "usa",
+    "uk",
+    "germany",
+    "netherlands",
+    "canada",
+    "france",
+    "sweden",
+    "switzerland",
+    "spain",
+    "italy",
+    "belgium",
+    "denmark",
+    "norway",
+    "finland",
+    "austria",
+    "ireland",
+    "poland",
+    "czech-republic",
+    "luxembourg",
+    "romania",
+    "singapore",
+    "japan",
+    "hong-kong",
+    "australia",
+    "south-korea",
+    "taiwan",
+    "turkey",
+    "uae",
+    "portugal",
+    "hungary",
+    "bulgaria",
+    "greece",
+]
+# Other spellings of the same country (all lower-case, words joined by "-").
+COUNTRY_ALIASES = {
+    "us": "usa",
+    "united-states": "usa",
+    "united-states-of-america": "usa",
+    "america": "usa",
+    "united-kingdom": "uk",
+    "great-britain": "uk",
+    "england": "uk",
+    "the-netherlands": "netherlands",
+    "holland": "netherlands",
+    "czechia": "czech-republic",
+    "czech": "czech-republic",
+    "united-arab-emirates": "uae",
+    "korea": "south-korea",
+    "hongkong": "hong-kong",
+    "turkiye": "turkey",
+}
 
 # --- how the next server is picked ------------------------------------------
-# Weighted random order: a better score means a much higher chance to be tried
-# early, but nothing is fixed. 0 = pure random, 3 = leans to the best, 6+ = almost
-# always the best. Weak/unknown servers still get an occasional turn.
+# Order of play:
+#   1. servers that connected before (and are not resting), country by country in
+#      COUNTRY_PRIORITY order; inside a country, the most reliable ones lean to the front
+#   2. servers with no successful connection yet, country by country in the same order,
+#      randomly inside each country
+#   3. servers that are resting after repeated failures (same rules)
+# Inside a country the order is a weighted random shuffle: 0 = pure random,
+# 3 = leans to the best, 6+ = almost always the best.
 PICK_SHARPNESS = 5.0
-FAST_PATH_CHANCE = 0.5  # chance to retry the last good server first (skips listing servers)
+FAST_PATH_CHANCE = 0.5  # chance to retry the last good server first (skips listing servers);
+#                         only used when that server is in the best country you have history with
 
 # --- notification on connect (notify.py) ------------------------------------
 NOTIFY_SOUND = True  # play a Windows system sound when the VPN gets connected
@@ -83,6 +114,8 @@ NOTIFY_TOAST = False  # Windows toast (can be hidden by Focus Assist / app permi
 FPS = 20
 
 # --- launcher (launch.py) ---------------------------------------------------
+DISCONNECT_VISUAL = True  # animated screen when the launcher disconnects a running VPN
+DISCONNECT_HOLD = 1.2  # seconds the "disconnected" screen stays before the window closes
 CLOSE_AFTER = 5  # seconds to keep the window open after the VPN is connected
 READY_TIMEOUT = 60  # seconds to wait for ExpressVPN to become ready
 FALLBACK_AFTER = (
@@ -105,9 +138,6 @@ APP_CANDIDATES = [
     r"C:\Program Files\ExpressVPN\expressvpn-client.exe",
     r"C:\Program Files (x86)\ExpressVPN\expressvpn-client.exe",
 ]
-
-USER_AGENT = "Expresso"
-
 
 def __getattr__(name):
     # Lazy attribute: importing pathlib costs time, and the launcher does not need it.
